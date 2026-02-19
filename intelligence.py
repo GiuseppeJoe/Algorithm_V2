@@ -14,20 +14,81 @@ import deployer
 HISTORY_FILE = "processed_history.json"
 
 # --- 1. THE OMNI-SCRAPER CONFIGURATION ---
-RSS_FEEDS = {
+
+# TIER 1: Tabloid / Viral News (highest meme potential)
+FEEDS_TABLOID = {
     "TMZ (Celebrity/Scandal)": "https://www.tmz.com/rss.xml",
     "NY Post (Culture/Florida Man)": "https://nypost.com/feed/",
-    "Fox News (Politics/Conflict)": "http://feeds.foxnews.com/foxnews/latest",
-    "ZeroHedge (Market Crash/Geopolitics)": "https://feeds.feedburner.com/zerohedge/feed",
-    "CoinTelegraph (Crypto Hacks)": "https://cointelegraph.com/rss"
+    "Daily Mail (UK Tabloid)": "https://www.dailymail.co.uk/articles.rss",
+    "The Sun (UK Viral)": "https://www.thesun.co.uk/feed/",
+    "Page Six (Gossip)": "https://pagesix.com/feed/",
 }
 
+# TIER 2: Hard News / Breaking (war, disasters, politics)
+FEEDS_BREAKING = {
+    "Fox News (Politics/Conflict)": "http://feeds.foxnews.com/foxnews/latest",
+    "BBC World (Global Events)": "http://feeds.bbci.co.uk/news/world/rss.xml",
+    "AP News (Wire Service)": "https://rsshub.app/apnews/topics/apf-topnews",
+    "Reuters (Global Wire)": "https://www.reutersagency.com/feed/",
+    "Al Jazeera (Intl Conflict)": "https://www.aljazeera.com/xml/rss/all.xml",
+    "NPR News (US Breaking)": "https://feeds.npr.org/1001/rss.xml",
+}
+
+# TIER 3: Crypto / Finance (hacks, crashes, rug pulls)
+FEEDS_CRYPTO = {
+    "CoinTelegraph (Crypto Hacks)": "https://cointelegraph.com/rss",
+    "CoinDesk (Crypto News)": "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "Decrypt (Crypto/Web3)": "https://decrypt.co/feed",
+    "ZeroHedge (Market Crash/Geopolitics)": "https://feeds.feedburner.com/zerohedge/feed",
+}
+
+# TIER 4: Reddit Viral Subreddits (trending meme material)
+FEEDS_REDDIT = {
+    "Reddit r/news": "https://www.reddit.com/r/news/top/.rss?t=day",
+    "Reddit r/worldnews": "https://www.reddit.com/r/worldnews/top/.rss?t=day",
+    "Reddit r/nottheonion": "https://www.reddit.com/r/nottheonion/top/.rss?t=day",
+    "Reddit r/CryptoCurrency": "https://www.reddit.com/r/CryptoCurrency/top/.rss?t=day",
+    "Reddit r/FloridaMan": "https://www.reddit.com/r/FloridaMan/top/.rss?t=day",
+    "Reddit r/PublicFreakout": "https://www.reddit.com/r/PublicFreakout/top/.rss?t=day",
+}
+
+# TIER 5: Google News topic feeds (broad viral coverage)
+FEEDS_GOOGLE_NEWS = {
+    "Google News - World": "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx1YlY4U0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en",
+    "Google News - Business": "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx6TVdZU0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en",
+    "Google News - Technology": "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGRqTVhZU0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en",
+    "Google News - Entertainment": "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNREpxYW5RU0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en",
+    "Google News - Science": "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRFp0Y1RjU0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en",
+}
+
+# Combine all feeds into master dict
+RSS_FEEDS = {}
+RSS_FEEDS.update(FEEDS_TABLOID)
+RSS_FEEDS.update(FEEDS_BREAKING)
+RSS_FEEDS.update(FEEDS_CRYPTO)
+RSS_FEEDS.update(FEEDS_REDDIT)
+RSS_FEEDS.update(FEEDS_GOOGLE_NEWS)
+
 HUNTER_KEYWORDS = [
-    "assassinated", "fatally shot", "found dead", 
-    "arrested", "indicted", "sex tape leaked",
-    "hacked for millions", "stolen funds", 
-    "declared war", "missile strike",
-    "bizarre", "florida man arrested"
+    # Death & Violence
+    "assassinated", "fatally shot", "found dead", "mass shooting",
+    "stabbed to death", "overdose death celebrity", "killed in crash",
+    # Crime & Scandal
+    "arrested", "indicted", "sex tape leaked", "caught on camera crime",
+    "florida man arrested", "influencer arrested", "celebrity mugshot",
+    "leaked photos scandal",
+    # Hacks & Crypto
+    "hacked for millions", "stolen funds", "crypto rug pull",
+    "exchange hacked", "bitcoin crash today", "crypto scam exposed",
+    # War & Geopolitics
+    "declared war", "missile strike", "military coup",
+    "nuclear threat", "hostage situation", "terrorist attack",
+    # Disasters & Nature
+    "earthquake today", "tornado destroys", "wildfire evacuations",
+    "plane crash", "bridge collapse",
+    # Weird & Viral
+    "bizarre", "UFO sighting confirmed", "shark attack",
+    "bear attack", "animal escapes zoo", "viral video breaking",
 ]
 
 def load_history():
@@ -50,38 +111,59 @@ def is_recently_processed(link, history):
 def gather_omni_news(sources_toggles):
     print("🕸️ Deploying Omni-Scraper...")
     raw_news_pool = []
-    
-    # 1. RSS FIREHOSE
-    for name, url in RSS_FEEDS.items():
+
+    # Build active feed list based on toggles
+    active_feeds = {}
+    if sources_toggles.get("tabloid", True):
+        active_feeds.update(FEEDS_TABLOID)
+    if sources_toggles.get("breaking", True):
+        active_feeds.update(FEEDS_BREAKING)
+    if sources_toggles.get("crypto", True):
+        active_feeds.update(FEEDS_CRYPTO)
+    if sources_toggles.get("reddit", True):
+        active_feeds.update(FEEDS_REDDIT)
+    if sources_toggles.get("google_news", True):
+        active_feeds.update(FEEDS_GOOGLE_NEWS)
+
+    # 1. RSS FIREHOSE — 10 entries per feed for wider coverage
+    for name, url in active_feeds.items():
         print(f"   -> Tapping feed: {name}")
         try:
             feed = feedparser.parse(url)
-            for entry in feed.entries[:5]: 
-                raw_news_pool.append({
-                    "topic": entry.title,
-                    "link": entry.link,
-                    "source": name
-                })
+            for entry in feed.entries[:10]:
+                link = entry.get("link", "")
+                title = entry.get("title", "")
+                if link and title:
+                    raw_news_pool.append({
+                        "topic": title,
+                        "link": link,
+                        "source": name
+                    })
         except Exception as e:
             print(f"      [!] Failed to read {name}: {e}")
 
-    # 2. KEYWORD HUNTER
-    print("   -> Deploying Keyword Hunter...")
-    try:
-        with DDGS() as ddgs:
-            for keyword in HUNTER_KEYWORDS:
-                results = ddgs.news(keyword, max_results=2)
-                if results:
-                    for r in results:
-                        raw_news_pool.append({
-                            "topic": r['title'],
-                            "link": r['url'],
-                            "source": f"Hunter: '{keyword}'"
-                        })
-    except Exception as e:
-        print(f"      [!] DDGS Hunter failed: {e}")
+    # 2. KEYWORD HUNTER — 3 results per keyword for deeper reach
+    if sources_toggles.get("keyword_hunter", True):
+        print("   -> Deploying Keyword Hunter...")
+        try:
+            with DDGS() as ddgs:
+                for keyword in HUNTER_KEYWORDS:
+                    try:
+                        results = ddgs.news(keyword, max_results=3)
+                        if results:
+                            for r in results:
+                                raw_news_pool.append({
+                                    "topic": r['title'],
+                                    "link": r['url'],
+                                    "source": f"Hunter: '{keyword}'"
+                                })
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"      [!] DDGS Hunter failed: {e}")
 
     unique_news = {item['link']: item for item in raw_news_pool}.values()
+    print(f"   -> {len(raw_news_pool)} raw items, {len(unique_news)} unique after dedup")
     return list(unique_news)
 
 def scrape_article(url, fallback_title=""):
