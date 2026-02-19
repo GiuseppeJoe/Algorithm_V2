@@ -92,15 +92,14 @@ async function runDeployment() {
         const [eventAuthority] = PublicKey.findProgramAddressSync([Buffer.from("__event_authority")], PUMP_PROGRAM_ID);
 
         // 3. BUILD INSTRUCTION DATA MANUALLY
-        // ✅ SURGICAL FIX: The smart contract requires exactly 4 arguments (Name, Symbol, URI, Creator_Pubkey).
-        // We are now properly passing your 32-byte wallet public key at the very end of the buffer.
-        const discriminator = Buffer.from([24, 30, 200, 40, 5, 28, 7, 119]); 
+        // Pump.fun create instruction takes exactly 3 args: name, symbol, uri
+        // The creator is passed as account key index 7, NOT in instruction data
+        const discriminator = Buffer.from([24, 30, 200, 40, 5, 28, 7, 119]);
         const nameBuffer = encodeString(coinData.name);
         const symbolBuffer = encodeString(coinData.symbol);
         const uriBuffer = encodeString(metadataResponse.metadataUri);
-        const creatorBuffer = keypair.publicKey.toBuffer(); // The missing 32 bytes
 
-        const data = Buffer.concat([discriminator, nameBuffer, symbolBuffer, uriBuffer, creatorBuffer]);
+        const data = Buffer.concat([discriminator, nameBuffer, symbolBuffer, uriBuffer]);
 
         // 4. DEFINE STRICT ACCOUNT KEYS (14 accounts per official pump.fun IDL)
         const keys = [
