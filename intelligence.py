@@ -5,13 +5,21 @@ from datetime import datetime, timedelta
 import os
 import json
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from newspaper import Article
 from duckduckgo_search import DDGS
-from openai import OpenAI  
-from news_analyzer import NewsImpactAnalyzer 
+from openai import OpenAI
+from news_analyzer import NewsImpactAnalyzer
 import deployer
 
 HISTORY_FILE = "processed_history.json"
+
+# --- PARALLELISM CONFIG ---
+MAX_FEED_WORKERS = 15      # RSS feeds fetched in parallel
+MAX_KEYWORD_WORKERS = 6    # DDGS keyword searches in parallel
+MAX_SCRAPE_WORKERS = 20    # Articles scraped in parallel
+MAX_AI_WORKERS = 10        # GPT-4o analysis calls in parallel
 
 # --- 1. THE OMNI-SCRAPER CONFIGURATION ---
 
@@ -91,6 +99,10 @@ HUNTER_KEYWORDS = [
     "bear attack", "animal escapes zoo", "viral video breaking",
 ]
 
+# ============================================================
+# UTILITY FUNCTIONS
+# ============================================================
+
 def load_history():
     if os.path.exists(HISTORY_FILE):
         with open(HISTORY_FILE, "r") as f:
@@ -108,8 +120,43 @@ def is_recently_processed(link, history):
             return True
     return False
 
+# ============================================================
+# STAGE 1: PARALLEL NEWS GATHERING
+# ============================================================
+
+def _fetch_single_feed(name, url):
+    """Fetch one RSS feed. Runs inside a thread."""
+    items = []
+    try:
+        feed = feedparser.parse(url)
+        for entry in feed.entries[:10]:
+            link = entry.get("link", "")
+            title = entry.get("title", "")
+            if link and title:
+                items.append({"topic": title, "link": link, "source": name})
+    except Exception as e:
+        print(f"      [!] Failed to read {name}: {e}")
+    return items
+
+def _search_single_keyword(keyword):
+    """Search one keyword via DDGS. Runs inside a thread."""
+    items = []
+    try:
+        ddgs = DDGS()
+        results = ddgs.news(keyword, max_results=3)
+        if results:
+            for r in results:
+                items.append({
+                    "topic": r['title'],
+                    "link": r['url'],
+                    "source": f"Hunter: '{keyword}'"
+                })
+    except Exception:
+        pass
+    return items
+
 def gather_omni_news(sources_toggles):
-    print("🕸️ Deploying Omni-Scraper...")
+    print("🕸️ Deploying Omni-Scraper (PARALLEL MODE)...")
     raw_news_pool = []
 
     # Build active feed list based on toggles
@@ -125,46 +172,34 @@ def gather_omni_news(sources_toggles):
     if sources_toggles.get("google_news", True):
         active_feeds.update(FEEDS_GOOGLE_NEWS)
 
-    # 1. RSS FIREHOSE — 10 entries per feed for wider coverage
-    for name, url in active_feeds.items():
-        print(f"   -> Tapping feed: {name}")
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:10]:
-                link = entry.get("link", "")
-                title = entry.get("title", "")
-                if link and title:
-                    raw_news_pool.append({
-                        "topic": title,
-                        "link": link,
-                        "source": name
-                    })
-        except Exception as e:
-            print(f"      [!] Failed to read {name}: {e}")
+    # --- PARALLEL RSS FIREHOSE ---
+    print(f"   -> Fetching {len(active_feeds)} RSS feeds in parallel...")
+    with ThreadPoolExecutor(max_workers=MAX_FEED_WORKERS) as executor:
+        futures = {
+            executor.submit(_fetch_single_feed, name, url): name
+            for name, url in active_feeds.items()
+        }
+        for future in as_completed(futures):
+            raw_news_pool.extend(future.result())
 
-    # 2. KEYWORD HUNTER — 3 results per keyword for deeper reach
+    # --- PARALLEL KEYWORD HUNTER ---
     if sources_toggles.get("keyword_hunter", True):
-        print("   -> Deploying Keyword Hunter...")
-        try:
-            with DDGS() as ddgs:
-                for keyword in HUNTER_KEYWORDS:
-                    try:
-                        results = ddgs.news(keyword, max_results=3)
-                        if results:
-                            for r in results:
-                                raw_news_pool.append({
-                                    "topic": r['title'],
-                                    "link": r['url'],
-                                    "source": f"Hunter: '{keyword}'"
-                                })
-                    except Exception:
-                        pass
-        except Exception as e:
-            print(f"      [!] DDGS Hunter failed: {e}")
+        print(f"   -> Hunting {len(HUNTER_KEYWORDS)} keywords in parallel...")
+        with ThreadPoolExecutor(max_workers=MAX_KEYWORD_WORKERS) as executor:
+            futures = [
+                executor.submit(_search_single_keyword, kw)
+                for kw in HUNTER_KEYWORDS
+            ]
+            for future in as_completed(futures):
+                raw_news_pool.extend(future.result())
 
     unique_news = {item['link']: item for item in raw_news_pool}.values()
     print(f"   -> {len(raw_news_pool)} raw items, {len(unique_news)} unique after dedup")
     return list(unique_news)
+
+# ============================================================
+# STAGE 2: PARALLEL ARTICLE SCRAPING
+# ============================================================
 
 def scrape_article(url, fallback_title=""):
     """
@@ -194,25 +229,84 @@ def scrape_article(url, fallback_title=""):
             response = requests.get(url, headers=headers, timeout=5)
             soup = BeautifulSoup(response.text, 'html.parser')
             paragraphs = soup.find_all('p')
-            text = " ".join([p.text for p in paragraphs[:5]]) # Grab first 5 paragraphs
+            text = " ".join([p.text for p in paragraphs[:5]])
             if not title and soup.title:
                 title = soup.title.string
         except Exception:
             pass
 
     # Attempt 3: The "Gold Mine" Fallback
-    # If we got absolutely blocked, we feed the AI the headline. DO NOT SKIP.
     if len(text) < 10:
         text = f"BREAKING NEWS: {title}. (Full article text was blocked by site security, but the headline confirms the event occurred)."
 
     return text, title
 
+def scrape_all_articles(news_items):
+    """Scrape all articles in parallel. Returns dict of link -> (text, title)."""
+    results = {}
+    print(f"📰 Scraping {len(news_items)} articles in parallel...")
+
+    def _scrape_one(item):
+        link = item['link']
+        topic = item['topic']
+        text, title = scrape_article(link, fallback_title=topic)
+        return link, text, title
+
+    with ThreadPoolExecutor(max_workers=MAX_SCRAPE_WORKERS) as executor:
+        futures = [executor.submit(_scrape_one, item) for item in news_items]
+        for future in as_completed(futures):
+            try:
+                link, text, title = future.result()
+                results[link] = (text, title)
+            except Exception:
+                pass
+
+    print(f"   -> Scraped {len(results)} articles successfully")
+    return results
+
+# ============================================================
+# STAGE 3: PARALLEL AI ANALYSIS
+# ============================================================
+
+def analyze_all_stories(analyzer, items_with_text):
+    """
+    Run AI analysis on all items in parallel.
+    items_with_text: list of (item, text, headline) tuples
+    Returns list of (item, analysis_result) tuples
+    """
+    results = []
+    print(f"🧠 Analyzing {len(items_with_text)} stories with AI in parallel...")
+
+    def _analyze_one(item, headline, text):
+        analysis_result = analyzer.analyze_story(headline, text)
+        return item, analysis_result
+
+    with ThreadPoolExecutor(max_workers=MAX_AI_WORKERS) as executor:
+        futures = [
+            executor.submit(_analyze_one, item, headline, text)
+            for item, text, headline in items_with_text
+        ]
+        for future in as_completed(futures):
+            try:
+                item, analysis_result = future.result()
+                results.append((item, analysis_result))
+            except Exception:
+                pass
+
+    print(f"   -> Analyzed {len(results)} stories successfully")
+    return results
+
+# ============================================================
+# IMAGE GENERATION (NON-BLOCKING)
+# ============================================================
+
 def generate_coin_image(api_key, prompt, ticker):
-    print(f"🎨 Generating branding for {ticker} with prompt: {prompt[:50]}...")
+    """Generate coin image with DALL-E 3. Can be called in a background thread."""
+    print(f"🎨 Generating branding for {ticker}...")
     try:
         client = OpenAI(api_key=api_key)
         full_prompt = f"{prompt}. High quality, viral internet meme style. ABSOLUTELY NO crypto symbols, NO bitcoin logos, and NO generic crypto coins in the image."
-        
+
         response = client.images.generate(
             model="dall-e-3",
             prompt=full_prompt,
@@ -224,83 +318,136 @@ def generate_coin_image(api_key, prompt, ticker):
         img_data = requests.get(image_url).content
         with open("coin_image.png", "wb") as handler:
             handler.write(img_data)
-        print("✅ Image generated and saved as coin_image.png")
+        print(f"✅ Image for {ticker} generated and saved")
         return True
     except Exception as e:
-        print(f"❌ Image generation failed: {e}")
+        print(f"❌ Image generation failed for {ticker}: {e}")
+        # Write a minimal valid PNG so deploy.js doesn't crash
         with open("coin_image.png", "wb") as f:
             f.write(b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82')
         return False
 
+def generate_coin_image_async(api_key, prompt, ticker):
+    """
+    Fire-and-forget image generation in a background thread.
+    Returns the thread so caller can optionally join() later.
+    """
+    thread = threading.Thread(
+        target=generate_coin_image,
+        args=(api_key, prompt, ticker),
+        daemon=True
+    )
+    thread.start()
+    return thread
+
+# ============================================================
+# MAIN PIPELINE — FULLY PARALLELIZED
+# ============================================================
+
 def generate_intelligence_report(api_key, sources):
-    print("\n--- 🧠 STARTING INTELLIGENCE CYCLE ---")
+    """
+    The full intelligence cycle, now running in 4 parallel stages:
+      1. Gather news (parallel RSS + parallel keyword hunt)
+      2. Scrape all articles (parallel)
+      3. AI-analyze all articles (parallel)
+      4. Deploy mints (image gen runs async alongside deploy)
+    """
+    cycle_start = time.time()
+    print("\n--- 🧠 STARTING INTELLIGENCE CYCLE (PARALLEL ENGINE) ---")
     analyzer = NewsImpactAnalyzer(api_key)
     history = load_history()
     report = []
-    
+
+    # ── STAGE 1: Gather news (already parallel inside) ──
+    stage1_start = time.time()
     news_items = gather_omni_news(sources)
-    print(f"📡 Omni-Scraper returned {len(news_items)} total potential targets.")
-    
-    for item in news_items:
+    print(f"📡 Stage 1 complete: {len(news_items)} targets in {time.time()-stage1_start:.1f}s")
+
+    # Filter out already-processed items BEFORE scraping (saves tons of work)
+    new_items = [item for item in news_items if not is_recently_processed(item['link'], history)]
+    print(f"📡 {len(new_items)} new items after dedup filter (skipped {len(news_items)-len(new_items)} already processed)")
+
+    if not new_items:
+        print("\n--- 🏁 INTELLIGENCE CYCLE COMPLETE (0 new items) ---")
+        return report
+
+    # ── STAGE 2: Scrape all new articles in parallel ──
+    stage2_start = time.time()
+    scraped = scrape_all_articles(new_items)
+    print(f"📰 Stage 2 complete: {len(scraped)} articles scraped in {time.time()-stage2_start:.1f}s")
+
+    # Build list of (item, text, headline) for AI analysis
+    items_for_analysis = []
+    for item in new_items:
+        link = item['link']
+        if link in scraped:
+            text, headline = scraped[link]
+            if text or headline:
+                items_for_analysis.append((item, text, headline))
+
+    # ── STAGE 3: AI-analyze all stories in parallel ──
+    stage3_start = time.time()
+    analysis_results = analyze_all_stories(analyzer, items_for_analysis)
+    print(f"🧠 Stage 3 complete: {len(analysis_results)} analyses in {time.time()-stage3_start:.1f}s")
+
+    # ── STAGE 4: Process results & deploy mints ──
+    stage4_start = time.time()
+    for item, analysis_result in analysis_results:
         topic = item['topic']
         news_link = item['link']
-        source = item['source']
-        
-        if is_recently_processed(news_link, history):
-            continue
-            
-        print(f"\n🔍 TARGET ACQUIRED: {topic} (Source: {source})")
-        
-        # We now pass the 'topic' (headline) as a fallback so it never fails
-        text, headline = scrape_article(news_link, fallback_title=topic)
-        
-        # If we have ANY text or a headline, we proceed. No more skipping!
-        if text or headline:
-            print(f"🧠 AI Analyzing impact...")
-            analysis_result = analyzer.analyze_story(headline, text)
-            
-            if "error" not in analysis_result:
-                coin_meta = analysis_result.get("coin_metadata", {})
-                headline_analysis = analysis_result.get("headline_analysis", {})
-                
-                entry = {
-                    "topic": topic,
-                    "news_headline": headline,
-                    "news_link": news_link,
-                    "analysis": headline_analysis,
-                    "coin_metadata": coin_meta
-                }
-                report.append(entry)
-                
-                history[news_link] = datetime.now().isoformat()
-                save_history(history)
-                
-                if headline_analysis.get("mint_decision"):
-                    ticker = coin_meta.get('suggested_ticker', '$UNKNOWN')
-                    print(f"🚀 THRESHOLD BREACHED: {ticker} IS GO FOR LAUNCH.")
-                    
-                    visual_prompt = coin_meta.get("visual_style_prompt", "Literal viral internet meme")
-                    generate_coin_image(api_key, visual_prompt, ticker)
-                    
-                    deploy_result = deployer.launch_on_pump_fun(
-                        name=coin_meta.get("coin_name", ticker),
-                        ticker=ticker,
-                        description=coin_meta.get("narrative_description", ""),
-                        image_prompt=visual_prompt
-                    )
-                    
-                    if deploy_result.get("success"):
-                        entry["mint_url"] = deploy_result.get("url")
-                        entry["mint_address"] = deploy_result.get("address")
-                        print(f"🔗 LIVE AT: {entry['mint_url']}")
-                    else:
-                        entry["mint_error"] = deploy_result.get("error", "Deployment Failed")
-            else:
-                print(f"⚠️ AI Analysis failed: {analysis_result.get('error')}")
-        else:
-            print(f"⚠️ Complete failure to read headline or text. Skipping.")
-        
-        time.sleep(1)
+        text, headline = scraped.get(news_link, ("", topic))
 
-    print("\n--- 🏁 INTELLIGENCE CYCLE COMPLETE ---")
+        if "error" in analysis_result:
+            print(f"⚠️ AI Analysis failed for: {topic[:60]} — {analysis_result.get('error')}")
+            continue
+
+        coin_meta = analysis_result.get("coin_metadata", {})
+        headline_analysis = analysis_result.get("headline_analysis", {})
+
+        entry = {
+            "topic": topic,
+            "news_headline": headline,
+            "news_link": news_link,
+            "analysis": headline_analysis,
+            "coin_metadata": coin_meta
+        }
+        report.append(entry)
+
+        # Mark as processed
+        history[news_link] = datetime.now().isoformat()
+
+        if headline_analysis.get("mint_decision"):
+            ticker = coin_meta.get('suggested_ticker', '$UNKNOWN')
+            print(f"🚀 THRESHOLD BREACHED: {ticker} IS GO FOR LAUNCH.")
+
+            visual_prompt = coin_meta.get("visual_style_prompt", "Literal viral internet meme")
+
+            # Fire off image generation in background — DON'T WAIT for it
+            img_thread = generate_coin_image_async(api_key, visual_prompt, ticker)
+
+            # Deploy immediately while image generates
+            deploy_result = deployer.launch_on_pump_fun(
+                name=coin_meta.get("coin_name", ticker),
+                ticker=ticker,
+                description=coin_meta.get("narrative_description", ""),
+                image_prompt=visual_prompt
+            )
+
+            # Now wait for image to finish (it's probably done by now)
+            img_thread.join(timeout=30)
+
+            if deploy_result.get("success"):
+                entry["mint_url"] = deploy_result.get("url")
+                entry["mint_address"] = deploy_result.get("address")
+                print(f"🔗 LIVE AT: {entry['mint_url']}")
+            else:
+                entry["mint_error"] = deploy_result.get("error", "Deployment Failed")
+
+    # Save history once at the end (not after every item)
+    save_history(history)
+
+    total_time = time.time() - cycle_start
+    mints = sum(1 for r in report if r['analysis'].get('mint_decision'))
+    print(f"\n--- 🏁 INTELLIGENCE CYCLE COMPLETE ---")
+    print(f"⏱️  Total time: {total_time:.1f}s | Processed: {len(report)} | Minted: {mints}")
     return report
