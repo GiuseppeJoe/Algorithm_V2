@@ -1,0 +1,9 @@
+streamlit
+requests
+beautifulsoup4
+feedparser
+newspaper3k
+lxml[html_clean]
+duckduckgo-search
+openai
+python-dotenv

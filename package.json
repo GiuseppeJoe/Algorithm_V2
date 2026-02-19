@@ -1,0 +1,16 @@
+{
+  "name": "ai-news-minter",
+  "version": "1.0.0",
+  "description": "AI Crypto Deployer",
+  "main": "deploy.js",
+  "scripts": {
+    "start": "node deploy.js"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@solana/web3.js": "^1.91.0",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.4.5",
+    "pumpdotfun-sdk": "1.3.2"
+  }
+}
