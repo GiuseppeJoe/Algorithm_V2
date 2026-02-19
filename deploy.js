@@ -17,7 +17,7 @@ const {
     TOKEN_PROGRAM_ID, 
     ASSOCIATED_TOKEN_PROGRAM_ID 
 } = require('@solana/spl-token');
-const bs58 = require('bs58');
+const bs58 = require('bs58').default;
 
 // --- CONFIGURATION ---
 const RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"; 
