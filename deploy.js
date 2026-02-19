@@ -101,22 +101,22 @@ async function runDeployment() {
 
         const data = Buffer.concat([discriminator, nameBuffer, symbolBuffer, uriBuffer, creatorBuffer]);
 
-        // 4. DEFINE STRICT ACCOUNT KEYS
-        // Removed the invalid 14th key (global_volume_accumulator). It only belongs to the Buy instruction.
+        // 4. DEFINE STRICT ACCOUNT KEYS (14 accounts per official pump.fun IDL)
         const keys = [
-            { pubkey: mint.publicKey, isSigner: true, isWritable: true },
-            { pubkey: mintAuthority, isSigner: false, isWritable: false },
-            { pubkey: bondingCurve, isSigner: false, isWritable: true },
-            { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
-            { pubkey: globalState, isSigner: false, isWritable: false },
-            { pubkey: metadataPDA, isSigner: false, isWritable: true },
-            { pubkey: keypair.publicKey, isSigner: true, isWritable: true },
-            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-            { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-            { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-            { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
-            { pubkey: eventAuthority, isSigner: false, isWritable: false },
-            { pubkey: PUMP_PROGRAM_ID, isSigner: false, isWritable: false }
+            { pubkey: mint.publicKey, isSigner: true, isWritable: true },          // 0: mint
+            { pubkey: mintAuthority, isSigner: false, isWritable: false },          // 1: mint_authority
+            { pubkey: bondingCurve, isSigner: false, isWritable: true },            // 2: bonding_curve
+            { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },  // 3: associated_bonding_curve
+            { pubkey: globalState, isSigner: false, isWritable: false },            // 4: global
+            { pubkey: MPL_TOKEN_METADATA, isSigner: false, isWritable: false },     // 5: mpl_token_metadata program
+            { pubkey: metadataPDA, isSigner: false, isWritable: true },             // 6: metadata
+            { pubkey: keypair.publicKey, isSigner: true, isWritable: true },        // 7: user
+            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },// 8: system_program
+            { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },       // 9: token_program
+            { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false }, // 10: associated_token_program
+            { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },     // 11: rent
+            { pubkey: eventAuthority, isSigner: false, isWritable: false },         // 12: event_authority
+            { pubkey: PUMP_PROGRAM_ID, isSigner: false, isWritable: false }         // 13: program
         ];
 
         const createIx = new TransactionInstruction({
