@@ -17,7 +17,8 @@ const {
     TOKEN_PROGRAM_ID, 
     ASSOCIATED_TOKEN_PROGRAM_ID 
 } = require('@solana/spl-token');
-const bs58 = require('bs58').default;
+const _bs58 = require('bs58');
+const bs58 = _bs58.default || _bs58;
 
 // --- CONFIGURATION ---
 const RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"; 
@@ -82,7 +83,7 @@ async function runDeployment() {
         const mint = Keypair.generate();
         console.log(`MINT_ADDRESS: ${mint.publicKey.toBase58()}`);
         
-        // 2. DERIVE EXACTLY 13 ACCOUNTS
+        // 2. DERIVE PDA ACCOUNTS
         const [mintAuthority] = PublicKey.findProgramAddressSync([Buffer.from("mint-authority")], PUMP_PROGRAM_ID);
         const [bondingCurve] = PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mint.publicKey.toBuffer()], PUMP_PROGRAM_ID);
         const associatedBondingCurve = getAssociatedTokenAddressSync(mint.publicKey, bondingCurve, true);
