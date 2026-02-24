@@ -425,12 +425,13 @@ def generate_intelligence_report(api_key, sources):
             # Fire off image generation in background — DON'T WAIT for it
             img_thread = generate_coin_image_async(api_key, visual_prompt, ticker)
 
-            # Deploy immediately while image generates
+            # Deploy immediately while image generates (bundled mode for atomic multi-wallet launch)
             deploy_result = deployer.launch_on_pump_fun(
                 name=coin_meta.get("coin_name", ticker),
                 ticker=ticker,
                 description=coin_meta.get("narrative_description", ""),
-                image_prompt=visual_prompt
+                image_prompt=visual_prompt,
+                bundled=True
             )
 
             # Now wait for image to finish (it's probably done by now)
