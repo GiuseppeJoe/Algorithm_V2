@@ -23,7 +23,15 @@ const bs58 = _bs58.default || _bs58;
 const BN = require('bn.js');
 
 // --- CONFIGURATION ---
-const RPC_ENDPOINT = process.env.RPC_ENDPOINT || "https://api.mainnet-beta.solana.com";
+const RPC_ENDPOINT = process.env.RPC_ENDPOINT;
+if (!RPC_ENDPOINT) {
+    console.error(`FAILURE: RPC_ENDPOINT not set in .env`);
+    console.error(`The public Solana RPC blocks programmatic access (403 Forbidden).`);
+    console.error(`Add a private RPC to your .env file:`);
+    console.error(`  RPC_ENDPOINT=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY`);
+    console.error(`Free RPC providers: Helius (helius.dev), QuickNode, Alchemy`);
+    process.exit(1);
+}
 const JITO_BLOCK_ENGINE_URL = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
 
 // Jito tip accounts (official)
