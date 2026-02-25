@@ -1,2 +1,4 @@
 node_modules/
 .env
+bundle_wallets/
+bundle_wallets.json

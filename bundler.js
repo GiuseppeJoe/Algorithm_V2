@@ -44,10 +44,11 @@ const BUY_SOL_PER_WALLET = parseFloat(process.env.BUNDLE_BUY_SOL || "0.001");
 const JITO_TIP_LAMPORTS = parseInt(process.env.JITO_TIP_LAMPORTS || "100000"); // 0.0001 SOL
 const SLIPPAGE_BPS = 2500n; // 25% slippage for bundled buys
 const MAX_TXS_PER_BUNDLE = 5;
-const WALLETS_FILE = "bundle_wallets.json";
+const WALLETS_DIR = "bundle_wallets";
+const DRY_RUN = process.argv.includes("--dry-run");
 
-// Read coin data from CLI payload
-const payloadFile = process.argv[2];
+// Read coin data from CLI payload (skip flags)
+const payloadFile = process.argv.slice(2).find(a => !a.startsWith('--'));
 let coinData = { name: "TEST", symbol: "TEST", description: "DEBUG" };
 if (payloadFile) {
     try { coinData = JSON.parse(fs.readFileSync(payloadFile, 'utf8')); }
@@ -56,10 +57,28 @@ if (payloadFile) {
 
 // =============================================================
 // PHASE 1: WALLET GENERATION
+//
+// Fresh wallets are created for EVERY launch. This is critical:
+//   - Each launch needs clean wallets with no on-chain history
+//   - Reusing wallets links launches together on-chain
+//   - Old wallets are archived to bundle_wallets/<timestamp>.json
+//     so you can recover leftover SOL later if needed
 // =============================================================
 
-function generateWallets(count) {
-    console.log(`\n[PHASE 1] Generating ${count} bundle wallets...`);
+function generateFreshWallets(count) {
+    console.log(`\n[PHASE 1] Generating ${count} fresh bundle wallets...`);
+
+    // Archive previous wallets (if any) so keys aren't lost
+    if (!fs.existsSync(WALLETS_DIR)) fs.mkdirSync(WALLETS_DIR);
+    const latestFile = `${WALLETS_DIR}/latest.json`;
+    if (fs.existsSync(latestFile)) {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const archivePath = `${WALLETS_DIR}/wallets_${timestamp}.json`;
+        fs.renameSync(latestFile, archivePath);
+        console.log(`   Archived previous wallets -> ${archivePath}`);
+    }
+
+    // Generate fresh keypairs
     const wallets = [];
     for (let i = 0; i < count; i++) {
         const kp = Keypair.generate();
@@ -69,21 +88,10 @@ function generateWallets(count) {
             secretKey: bs58.encode(kp.secretKey)
         });
     }
-    fs.writeFileSync(WALLETS_FILE, JSON.stringify(wallets, null, 2));
-    console.log(`   Generated ${count} wallets -> ${WALLETS_FILE}`);
-    return wallets;
-}
 
-function loadOrGenerateWallets(count) {
-    if (fs.existsSync(WALLETS_FILE)) {
-        const data = JSON.parse(fs.readFileSync(WALLETS_FILE, 'utf8'));
-        if (data.length === count) {
-            console.log(`[PHASE 1] Loaded ${data.length} existing wallets from ${WALLETS_FILE}`);
-            return data;
-        }
-        console.log(`   Wallet count mismatch (have ${data.length}, need ${count}). Regenerating...`);
-    }
-    return generateWallets(count);
+    fs.writeFileSync(latestFile, JSON.stringify(wallets, null, 2));
+    console.log(`   Generated ${count} wallets -> ${latestFile}`);
+    return wallets;
 }
 
 function toKeypair(walletData) {
@@ -407,6 +415,7 @@ async function main() {
     console.log(`\n========================================`);
     console.log(`  BUNDLED LAUNCH: $${coinData.symbol}`);
     console.log(`  Wallets: ${NUM_WALLETS} | Buy: ${BUY_SOL_PER_WALLET} SOL each`);
+    if (DRY_RUN) console.log(`  MODE: DRY RUN (no real transactions)`);
     console.log(`========================================`);
 
     // Load main wallet
@@ -422,8 +431,55 @@ async function main() {
     console.log(`   Main wallet: ${mainKeypair.publicKey.toBase58()}`);
 
     try {
-        // PHASE 1: Generate wallets
-        const walletData = loadOrGenerateWallets(NUM_WALLETS);
+        // PHASE 1: Generate fresh wallets (new every launch)
+        const walletData = generateFreshWallets(NUM_WALLETS);
+
+        // In dry-run mode, validate everything but don't spend SOL
+        if (DRY_RUN) {
+            console.log(`\n[DRY RUN] Validating configuration...`);
+
+            const balance = await connection.getBalance(mainKeypair.publicKey);
+            const lamportsPerWallet = Math.ceil((BUY_SOL_PER_WALLET + 0.003) * LAMPORTS_PER_SOL);
+            const totalFunding = lamportsPerWallet * NUM_WALLETS;
+            const totalCost = totalFunding + 0.02 * LAMPORTS_PER_SOL; // funding + create fees
+
+            console.log(`   Main wallet balance: ${(balance / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+            console.log(`   Cost per wallet:     ${(lamportsPerWallet / LAMPORTS_PER_SOL).toFixed(4)} SOL (${BUY_SOL_PER_WALLET} buy + 0.003 fees)`);
+            console.log(`   Total funding:       ${(totalFunding / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+            console.log(`   Total cost estimate: ${(totalCost / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+            console.log(`   Balance sufficient:  ${balance >= totalCost ? 'YES' : 'NO — need ' + ((totalCost - balance) / LAMPORTS_PER_SOL).toFixed(4) + ' more SOL'}`);
+
+            // Validate SDK can reach pump.fun global state
+            const globalAccount = await sdk.getGlobalAccount('confirmed');
+            console.log(`   Pump.fun global:     OK (fee recipient: ${globalAccount.feeRecipient.toBase58().slice(0, 8)}...)`);
+
+            const buyLamports = BigInt(Math.floor(BUY_SOL_PER_WALLET * LAMPORTS_PER_SOL));
+            const tokenAmount = globalAccount.getInitialBuyPrice(buyLamports);
+            const maxSolCost = calculateWithSlippageBuy(buyLamports, SLIPPAGE_BPS);
+            console.log(`   Tokens per wallet:   ~${tokenAmount.toString()}`);
+            console.log(`   Max SOL w/ slippage:  ${(Number(maxSolCost) / LAMPORTS_PER_SOL).toFixed(6)} SOL`);
+
+            // Show bundle layout
+            const firstGroupSize = MAX_TXS_PER_BUNDLE - 1;
+            const remainingWallets = NUM_WALLETS - firstGroupSize;
+            const extraBundles = Math.ceil(Math.max(0, remainingWallets) / MAX_TXS_PER_BUNDLE);
+            const totalBundles = 1 + extraBundles;
+            console.log(`   Bundle layout:       ${totalBundles} bundle(s)`);
+            console.log(`     B1: create + ${Math.min(firstGroupSize, NUM_WALLETS)} buys`);
+            for (let b = 0; b < extraBundles; b++) {
+                const start = firstGroupSize + b * MAX_TXS_PER_BUNDLE;
+                const count = Math.min(MAX_TXS_PER_BUNDLE, NUM_WALLETS - start);
+                console.log(`     B${b + 2}: ${count} buys`);
+            }
+
+            // Check coin image
+            const imageExists = fs.existsSync("coin_image.png");
+            console.log(`   Coin image:          ${imageExists ? 'OK (coin_image.png found)' : 'MISSING — coin_image.png not found'}`);
+
+            console.log(`\n[DRY RUN] Validation complete. No transactions sent.`);
+            console.log(`   Run without --dry-run to execute for real.`);
+            return;
+        }
 
         // PHASE 2: Fund wallets
         await fundWallets(connection, mainKeypair, walletData, BUY_SOL_PER_WALLET);
