@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import os
 import json
 import time
+import uuid
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from newspaper import Article
@@ -20,6 +21,7 @@ MAX_FEED_WORKERS = 15      # RSS feeds fetched in parallel
 MAX_KEYWORD_WORKERS = 6    # DDGS keyword searches in parallel
 MAX_SCRAPE_WORKERS = 20    # Articles scraped in parallel
 MAX_AI_WORKERS = 10        # GPT-4o analysis calls in parallel
+MAX_DEPLOY_WORKERS = 5     # Parallel coin launches (each gets its own bundler process)
 
 # --- 1. THE OMNI-SCRAPER CONFIGURATION ---
 
@@ -300,9 +302,10 @@ def analyze_all_stories(analyzer, items_with_text):
 # IMAGE GENERATION (NON-BLOCKING)
 # ============================================================
 
-def generate_coin_image(api_key, prompt, ticker):
+def generate_coin_image(api_key, prompt, ticker, deploy_id=None):
     """Generate coin image with DALL-E 3. Can be called in a background thread."""
-    print(f"🎨 Generating branding for {ticker}...")
+    output_file = f"coin_image_{deploy_id}.png" if deploy_id else "coin_image.png"
+    print(f"🎨 [{deploy_id or 'default'}] Generating branding for {ticker}...")
     try:
         client = OpenAI(api_key=api_key)
         full_prompt = f"{prompt}. High quality, viral internet meme style. ABSOLUTELY NO crypto symbols, NO bitcoin logos, and NO generic crypto coins in the image."
@@ -316,29 +319,16 @@ def generate_coin_image(api_key, prompt, ticker):
         )
         image_url = response.data[0].url
         img_data = requests.get(image_url).content
-        with open("coin_image.png", "wb") as handler:
+        with open(output_file, "wb") as handler:
             handler.write(img_data)
-        print(f"✅ Image for {ticker} generated and saved")
+        print(f"✅ [{deploy_id or 'default'}] Image for {ticker} generated and saved")
         return True
     except Exception as e:
-        print(f"❌ Image generation failed for {ticker}: {e}")
+        print(f"❌ [{deploy_id or 'default'}] Image generation failed for {ticker}: {e}")
         # Write a minimal valid PNG so deploy.js doesn't crash
-        with open("coin_image.png", "wb") as f:
+        with open(output_file, "wb") as f:
             f.write(b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82')
         return False
-
-def generate_coin_image_async(api_key, prompt, ticker):
-    """
-    Fire-and-forget image generation in a background thread.
-    Returns the thread so caller can optionally join() later.
-    """
-    thread = threading.Thread(
-        target=generate_coin_image,
-        args=(api_key, prompt, ticker),
-        daemon=True
-    )
-    thread.start()
-    return thread
 
 # ============================================================
 # MAIN PIPELINE — FULLY PARALLELIZED
@@ -390,8 +380,12 @@ def generate_intelligence_report(api_key, sources):
     analysis_results = analyze_all_stories(analyzer, items_for_analysis)
     print(f"🧠 Stage 3 complete: {len(analysis_results)} analyses in {time.time()-stage3_start:.1f}s")
 
-    # ── STAGE 4: Process results & deploy mints ──
+    # ── STAGE 4: Process results & deploy mints (PARALLEL) ──
     stage4_start = time.time()
+
+    # First pass: build report entries and collect mint-worthy coins
+    mint_queue = []  # list of (entry, coin_meta) tuples to deploy
+
     for item, analysis_result in analysis_results:
         topic = item['topic']
         news_link = item['link']
@@ -419,30 +413,52 @@ def generate_intelligence_report(api_key, sources):
         if headline_analysis.get("mint_decision"):
             ticker = coin_meta.get('suggested_ticker', '$UNKNOWN')
             print(f"🚀 THRESHOLD BREACHED: {ticker} IS GO FOR LAUNCH.")
+            mint_queue.append((entry, coin_meta))
 
+    # Second pass: deploy all mint-worthy coins in parallel
+    if mint_queue:
+        print(f"\n🚀 LAUNCHING {len(mint_queue)} COIN(S) IN PARALLEL...")
+
+        def _deploy_one_coin(entry, coin_meta, deploy_id):
+            """Generate image + deploy a single coin. Runs in its own thread."""
+            ticker = coin_meta.get('suggested_ticker', '$UNKNOWN')
             visual_prompt = coin_meta.get("visual_style_prompt", "Literal viral internet meme")
 
-            # Fire off image generation in background — DON'T WAIT for it
-            img_thread = generate_coin_image_async(api_key, visual_prompt, ticker)
+            # Generate image first (writes to coin_image_{deploy_id}.png)
+            generate_coin_image(api_key, visual_prompt, ticker, deploy_id=deploy_id)
 
-            # Deploy immediately while image generates (bundled mode for atomic multi-wallet launch)
+            # Deploy with bundler (reads coin_image_{deploy_id}.png)
             deploy_result = deployer.launch_on_pump_fun(
                 name=coin_meta.get("coin_name", ticker),
                 ticker=ticker,
                 description=coin_meta.get("narrative_description", ""),
                 image_prompt=visual_prompt,
-                bundled=True
+                bundled=True,
+                deploy_id=deploy_id
             )
-
-            # Now wait for image to finish (it's probably done by now)
-            img_thread.join(timeout=30)
 
             if deploy_result.get("success"):
                 entry["mint_url"] = deploy_result.get("url")
                 entry["mint_address"] = deploy_result.get("address")
-                print(f"🔗 LIVE AT: {entry['mint_url']}")
+                print(f"🔗 [{deploy_id}] LIVE AT: {entry['mint_url']}")
             else:
                 entry["mint_error"] = deploy_result.get("error", "Deployment Failed")
+
+            return entry
+
+        with ThreadPoolExecutor(max_workers=MAX_DEPLOY_WORKERS) as executor:
+            futures = {}
+            for entry, coin_meta in mint_queue:
+                deploy_id = uuid.uuid4().hex[:8]
+                future = executor.submit(_deploy_one_coin, entry, coin_meta, deploy_id)
+                futures[future] = coin_meta.get('suggested_ticker', '$UNKNOWN')
+
+            for future in as_completed(futures):
+                ticker = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"❌ Deployment failed for {ticker}: {e}")
 
     # Save history once at the end (not after every item)
     save_history(history)

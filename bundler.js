@@ -52,11 +52,16 @@ const BUY_SOL_PER_WALLET = parseFloat(process.env.BUNDLE_BUY_SOL || "0.001");
 const JITO_TIP_LAMPORTS = parseInt(process.env.JITO_TIP_LAMPORTS || "100000"); // 0.0001 SOL
 const SLIPPAGE_BPS = 2500n; // 25% slippage for bundled buys
 const MAX_TXS_PER_BUNDLE = 5;
-const WALLETS_DIR = "bundle_wallets";
 const DRY_RUN = process.argv.includes("--dry-run");
 
-// Read coin data from CLI payload (skip flags)
-const payloadFile = process.argv.slice(2).find(a => !a.startsWith('--'));
+// Deploy ID for parallel isolation — each concurrent launch gets its own files
+const deployIdIdx = process.argv.indexOf("--deploy-id");
+const DEPLOY_ID = deployIdIdx !== -1 ? process.argv[deployIdIdx + 1] : null;
+const WALLETS_DIR = DEPLOY_ID ? `bundle_wallets_${DEPLOY_ID}` : "bundle_wallets";
+const IMAGE_FILE = DEPLOY_ID ? `coin_image_${DEPLOY_ID}.png` : "coin_image.png";
+
+// Read coin data from CLI payload (skip flags and their values)
+const payloadFile = process.argv.slice(2).find((a, i, arr) => !a.startsWith('--') && (i === 0 || !arr[i - 1].startsWith('--')));
 let coinData = { name: "TEST", symbol: "TEST", description: "DEBUG" };
 if (payloadFile) {
     try { coinData = JSON.parse(fs.readFileSync(payloadFile, 'utf8')); }
@@ -163,7 +168,7 @@ async function fundWallets(connection, mainKeypair, walletDataList, solPerWallet
 
 async function uploadMetadata(sdk) {
     console.log(`\n[PHASE 3] Uploading coin metadata to IPFS...`);
-    const fileBuffer = fs.readFileSync("coin_image.png");
+    const fileBuffer = fs.readFileSync(IMAGE_FILE);
     const fileBlob = new Blob([fileBuffer], { type: 'image/png' });
 
     const result = await sdk.createTokenMetadata({
@@ -481,8 +486,8 @@ async function main() {
             }
 
             // Check coin image
-            const imageExists = fs.existsSync("coin_image.png");
-            console.log(`   Coin image:          ${imageExists ? 'OK (coin_image.png found)' : 'MISSING — coin_image.png not found'}`);
+            const imageExists = fs.existsSync(IMAGE_FILE);
+            console.log(`   Coin image:          ${imageExists ? `OK (${IMAGE_FILE} found)` : `MISSING — ${IMAGE_FILE} not found`}`);
 
             console.log(`\n[DRY RUN] Validation complete. No transactions sent.`);
             console.log(`   Run without --dry-run to execute for real.`);

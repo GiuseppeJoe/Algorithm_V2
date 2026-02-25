@@ -17,7 +17,12 @@ if (!RPC_ENDPOINT) {
     process.exit(1);
 }
 
-const payloadFile = process.argv[2];
+// Deploy ID for parallel isolation — each concurrent launch gets its own files
+const deployIdIdx = process.argv.indexOf("--deploy-id");
+const DEPLOY_ID = deployIdIdx !== -1 ? process.argv[deployIdIdx + 1] : null;
+const IMAGE_FILE = DEPLOY_ID ? `coin_image_${DEPLOY_ID}.png` : "coin_image.png";
+
+const payloadFile = process.argv.slice(2).find((a, i, arr) => !a.startsWith('--') && (i === 0 || !arr[i - 1].startsWith('--')));
 let coinData = { name: "TEST", symbol: "TEST", description: "DEBUG" };
 if (payloadFile) {
     try { coinData = JSON.parse(fs.readFileSync(payloadFile, 'utf8')); }
@@ -44,7 +49,7 @@ async function runDeployment() {
 
     try {
         // Read coin image
-        const fileBuffer = fs.readFileSync("coin_image.png");
+        const fileBuffer = fs.readFileSync(IMAGE_FILE);
         const fileBlob = new Blob([fileBuffer], { type: 'image/png' });
 
         // Use the SDK's createAndBuy — handles IPFS upload + on-chain create
