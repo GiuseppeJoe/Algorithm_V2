@@ -18,7 +18,7 @@ require('dotenv').config();
 const {
     Connection, Keypair, PublicKey, SystemProgram,
     TransactionMessage, VersionedTransaction,
-    LAMPORTS_PER_SOL, ComputeBudgetProgram
+    LAMPORTS_PER_SOL,
 } = require('@solana/web3.js');
 const {
     getAssociatedTokenAddress,
@@ -41,15 +41,31 @@ const DRY_RUN = process.argv.includes("--dry-run");
 const TOKENS_ONLY = process.argv.includes("--tokens-only");
 const SOL_ONLY = process.argv.includes("--sol-only");
 
-// Minimum SOL to leave behind for rent-exempt reserve (will be reclaimed when ATA is closed)
-const MIN_BALANCE_FOR_RENT = 890880; // lamports (~0.00089 SOL, minimum for an account)
 const TX_FEE = 5000; // lamports per signature
+const SWEEP_CONCURRENCY = parseInt(process.env.SWEEP_CONCURRENCY || "5");
 
 // Find wallet file from CLI args
 const walletFile = process.argv.slice(2).find(a => !a.startsWith('--')) || "bundle_wallets/latest.json";
 
 function toKeypair(walletData) {
     return Keypair.fromSecretKey(bs58.decode(walletData.secretKey));
+}
+
+// =============================================================
+// RETRY HELPER
+// =============================================================
+
+async function withRetry(fn, { retries = 3, baseDelay = 1000, label = '' } = {}) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            return await fn();
+        } catch (err) {
+            if (attempt === retries) throw err;
+            const delay = baseDelay * Math.pow(2, attempt);
+            console.log(`     [retry] ${label} attempt ${attempt + 1} failed: ${err.message} — retrying in ${delay}ms`);
+            await new Promise(r => setTimeout(r, delay));
+        }
+    }
 }
 
 // =============================================================
@@ -70,39 +86,38 @@ async function getTokenAccounts(connection, owner) {
             decimals: info.tokenAmount.decimals,
             uiAmount: info.tokenAmount.uiAmount,
         };
-    }).filter(t => t.amount > 0n); // only non-zero balances
+    });
 }
 
 // =============================================================
-// SWEEP SOL
+// SWEEP SOL — Parallel with concurrency limit
 // =============================================================
 
 async function sweepSol(connection, mainKeypair, walletData) {
-    console.log(`\n[SOL SWEEP] Checking ${walletData.length} wallets...`);
+    console.log(`\n[SOL SWEEP] Checking ${walletData.length} wallets (concurrency: ${SWEEP_CONCURRENCY})...`);
 
     let totalRecovered = 0;
     let walletsSwept = 0;
     const errors = [];
 
-    // Process wallets in batches to avoid rate limits
-    const BATCH_SIZE = 5;
-    for (let i = 0; i < walletData.length; i += BATCH_SIZE) {
-        const batch = walletData.slice(i, i + BATCH_SIZE);
+    // Process wallets in concurrent batches
+    for (let i = 0; i < walletData.length; i += SWEEP_CONCURRENCY) {
+        const batch = walletData.slice(i, i + SWEEP_CONCURRENCY);
 
-        for (const w of batch) {
+        const results = await Promise.allSettled(batch.map(async (w) => {
             const kp = toKeypair(w);
-            try {
-                const balance = await connection.getBalance(kp.publicKey);
-                const available = balance - TX_FEE; // need to cover the transfer tx fee
+            const balance = await connection.getBalance(kp.publicKey);
+            const available = balance - TX_FEE;
 
-                if (available <= 0) {
-                    console.log(`   Wallet ${w.index}: ${(balance / LAMPORTS_PER_SOL).toFixed(6)} SOL (nothing to sweep)`);
-                    continue;
-                }
+            if (available <= 0) {
+                console.log(`   Wallet ${w.index}: ${(balance / LAMPORTS_PER_SOL).toFixed(6)} SOL (nothing to sweep)`);
+                return 0;
+            }
 
-                console.log(`   Wallet ${w.index}: ${(balance / LAMPORTS_PER_SOL).toFixed(6)} SOL -> sending ${(available / LAMPORTS_PER_SOL).toFixed(6)} SOL`);
+            console.log(`   Wallet ${w.index}: ${(balance / LAMPORTS_PER_SOL).toFixed(6)} SOL -> sending ${(available / LAMPORTS_PER_SOL).toFixed(6)} SOL`);
 
-                if (!DRY_RUN) {
+            if (!DRY_RUN) {
+                await withRetry(async () => {
                     const { blockhash } = await connection.getLatestBlockhash('confirmed');
                     const instructions = [
                         SystemProgram.transfer({
@@ -123,13 +138,20 @@ async function sweepSol(connection, mainKeypair, walletData) {
                     const sig = await connection.sendTransaction(tx, { skipPreflight: false });
                     await connection.confirmTransaction(sig, 'confirmed');
                     console.log(`     TX: ${sig}`);
-                }
+                }, { label: `SOL wallet ${w.index}` });
+            }
 
-                totalRecovered += available;
+            return available;
+        }));
+
+        for (let j = 0; j < results.length; j++) {
+            if (results[j].status === 'fulfilled' && results[j].value > 0) {
+                totalRecovered += results[j].value;
                 walletsSwept++;
-            } catch (err) {
-                console.error(`   Wallet ${w.index}: ERROR - ${err.message}`);
-                errors.push({ wallet: w.index, error: err.message });
+            } else if (results[j].status === 'rejected') {
+                const w = batch[j];
+                console.error(`   Wallet ${w.index}: ERROR - ${results[j].reason.message}`);
+                errors.push({ wallet: w.index, error: results[j].reason.message });
             }
         }
     }
@@ -142,28 +164,42 @@ async function sweepSol(connection, mainKeypair, walletData) {
 }
 
 // =============================================================
-// SWEEP TOKENS
+// SWEEP TOKENS — Parallel with concurrency limit
+//
+// Key fixes over v1:
+//   - ATA rent goes directly to main wallet (not back to bundle wallet)
+//   - Main wallet pays for its own ATA creation (signed by both keypairs)
+//   - Wallets processed concurrently instead of sequentially
+//   - Tracks which mints already have a main-wallet ATA to avoid
+//     redundant creation instructions
 // =============================================================
 
 async function sweepTokens(connection, mainKeypair, walletData) {
-    console.log(`\n[TOKEN SWEEP] Checking ${walletData.length} wallets for token holdings...`);
+    console.log(`\n[TOKEN SWEEP] Checking ${walletData.length} wallets (concurrency: ${SWEEP_CONCURRENCY})...`);
 
     const tokenSummary = {}; // mint -> total amount
     let walletsWithTokens = 0;
     let atasClosedCount = 0;
     const errors = [];
 
-    for (const w of walletData) {
-        const kp = toKeypair(w);
-        try {
+    // Pre-check which ATAs already exist on the main wallet to avoid
+    // duplicate creation instructions across concurrent sweeps
+    const mainAtaCache = new Set(); // mints that definitely have an ATA
+
+    for (let i = 0; i < walletData.length; i += SWEEP_CONCURRENCY) {
+        const batch = walletData.slice(i, i + SWEEP_CONCURRENCY);
+
+        const results = await Promise.allSettled(batch.map(async (w) => {
+            const kp = toKeypair(w);
             const tokenAccounts = await getTokenAccounts(connection, kp.publicKey);
+            const nonZero = tokenAccounts.filter(t => t.amount > 0n);
 
-            if (tokenAccounts.length === 0) continue;
+            if (nonZero.length === 0) return { tokens: 0, closed: 0 };
 
-            walletsWithTokens++;
-            console.log(`   Wallet ${w.index}: ${tokenAccounts.length} token(s)`);
+            console.log(`   Wallet ${w.index}: ${nonZero.length} token(s)`);
+            let closed = 0;
 
-            for (const token of tokenAccounts) {
+            for (const token of nonZero) {
                 const mintStr = token.mint.toBase58();
                 if (!tokenSummary[mintStr]) {
                     tokenSummary[mintStr] = { total: 0n, decimals: token.decimals, wallets: 0 };
@@ -174,54 +210,75 @@ async function sweepTokens(connection, mainKeypair, walletData) {
                 console.log(`     ${mintStr.slice(0, 8)}... : ${token.uiAmount} tokens`);
 
                 if (!DRY_RUN) {
-                    // Ensure main wallet has an ATA for this mint
-                    const mainAta = await getAssociatedTokenAddress(token.mint, mainKeypair.publicKey, false);
-                    const sourceAta = token.address;
+                    await withRetry(async () => {
+                        const mainAta = await getAssociatedTokenAddress(token.mint, mainKeypair.publicKey, false);
+                        const sourceAta = token.address;
 
-                    const { blockhash } = await connection.getLatestBlockhash('confirmed');
-                    const instructions = [];
+                        const { blockhash } = await connection.getLatestBlockhash('confirmed');
+                        const instructions = [];
+                        const signers = [kp];
 
-                    // Check if main wallet ATA exists
-                    const mainAtaInfo = await connection.getAccountInfo(mainAta);
-                    if (!mainAtaInfo) {
+                        // Create main wallet ATA if needed (main wallet pays rent)
+                        if (!mainAtaCache.has(mintStr)) {
+                            const mainAtaInfo = await connection.getAccountInfo(mainAta);
+                            if (!mainAtaInfo) {
+                                instructions.push(
+                                    createAssociatedTokenAccountInstruction(
+                                        mainKeypair.publicKey, // payer (main wallet pays its own ATA rent)
+                                        mainAta,
+                                        mainKeypair.publicKey,
+                                        token.mint
+                                    )
+                                );
+                                signers.push(mainKeypair);
+                            }
+                            mainAtaCache.add(mintStr);
+                        }
+
+                        // Transfer tokens to main wallet
                         instructions.push(
-                            createAssociatedTokenAccountInstruction(
-                                kp.publicKey, mainAta, mainKeypair.publicKey, token.mint
+                            createTransferInstruction(
+                                sourceAta, mainAta, kp.publicKey, token.amount
                             )
                         );
-                    }
 
-                    // Transfer tokens to main wallet
-                    instructions.push(
-                        createTransferInstruction(
-                            sourceAta, mainAta, kp.publicKey, token.amount
-                        )
-                    );
+                        // Close the now-empty ATA — rent goes directly to main wallet
+                        instructions.push(
+                            createCloseAccountInstruction(
+                                sourceAta,
+                                mainKeypair.publicKey, // destination: rent SOL goes straight to main wallet
+                                kp.publicKey           // authority: bundle wallet owns this ATA
+                            )
+                        );
 
-                    // Close the now-empty ATA to reclaim rent SOL
-                    instructions.push(
-                        createCloseAccountInstruction(
-                            sourceAta, kp.publicKey, kp.publicKey
-                        )
-                    );
+                        const msg = new TransactionMessage({
+                            payerKey: kp.publicKey,
+                            recentBlockhash: blockhash,
+                            instructions,
+                        }).compileToV0Message();
 
-                    const msg = new TransactionMessage({
-                        payerKey: kp.publicKey,
-                        recentBlockhash: blockhash,
-                        instructions,
-                    }).compileToV0Message();
-
-                    const tx = new VersionedTransaction(msg);
-                    tx.sign([kp]);
-                    const sig = await connection.sendTransaction(tx, { skipPreflight: false });
-                    await connection.confirmTransaction(sig, 'confirmed');
-                    console.log(`     TX: ${sig}`);
-                    atasClosedCount++;
+                        const tx = new VersionedTransaction(msg);
+                        tx.sign(signers);
+                        const sig = await connection.sendTransaction(tx, { skipPreflight: false });
+                        await connection.confirmTransaction(sig, 'confirmed');
+                        console.log(`     TX: ${sig}`);
+                    }, { label: `token ${mintStr.slice(0, 8)} wallet ${w.index}` });
+                    closed++;
                 }
             }
-        } catch (err) {
-            console.error(`   Wallet ${w.index}: ERROR - ${err.message}`);
-            errors.push({ wallet: w.index, error: err.message });
+
+            return { tokens: nonZero.length, closed };
+        }));
+
+        for (let j = 0; j < results.length; j++) {
+            if (results[j].status === 'fulfilled') {
+                if (results[j].value.tokens > 0) walletsWithTokens++;
+                atasClosedCount += results[j].value.closed;
+            } else {
+                const w = batch[j];
+                console.error(`   Wallet ${w.index}: ERROR - ${results[j].reason.message}`);
+                errors.push({ wallet: w.index, error: results[j].reason.message });
+            }
         }
     }
 
@@ -235,7 +292,7 @@ async function sweepTokens(connection, mainKeypair, walletData) {
             console.log(`     ${mint.slice(0, 12)}... : ${uiAmount} tokens (from ${info.wallets} wallets)`);
         }
         if (!DRY_RUN) {
-            console.log(`   Closed ${atasClosedCount} token account(s) (rent reclaimed)`);
+            console.log(`   Closed ${atasClosedCount} token account(s) (rent reclaimed to main wallet)`);
         }
     } else {
         console.log(`   No tokens found in any wallet.`);

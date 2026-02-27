@@ -48,8 +48,15 @@ async function runDeployment() {
     console.log("🔥 INITIATING REAL TRANSACTION VIA SDK...");
 
     try {
-        // Read coin image
+        // Validate coin image exists and is non-trivial
+        if (!fs.existsSync(IMAGE_FILE)) {
+            console.error(`FAILURE: Image file not found: ${IMAGE_FILE}`);
+            process.exit(1);
+        }
         const fileBuffer = fs.readFileSync(IMAGE_FILE);
+        if (fileBuffer.length < 100) {
+            console.error(`WARNING: Image file is only ${fileBuffer.length} bytes (likely a fallback placeholder).`);
+        }
         const fileBlob = new Blob([fileBuffer], { type: 'image/png' });
 
         // Use the SDK's createAndBuy — handles IPFS upload + on-chain create

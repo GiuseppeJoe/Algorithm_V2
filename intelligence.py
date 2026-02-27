@@ -15,6 +15,7 @@ from news_analyzer import NewsImpactAnalyzer
 import deployer
 
 HISTORY_FILE = "processed_history.json"
+_history_lock = threading.Lock()
 
 # --- PARALLELISM CONFIG ---
 MAX_FEED_WORKERS = 15      # RSS feeds fetched in parallel
@@ -106,14 +107,28 @@ HUNTER_KEYWORDS = [
 # ============================================================
 
 def load_history():
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "r") as f:
-            return json.load(f)
-    return {}
+    with _history_lock:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, "r") as f:
+                return json.load(f)
+        return {}
 
 def save_history(history):
-    with open(HISTORY_FILE, "w") as f:
-        json.dump(history, f, indent=2)
+    with _history_lock:
+        # Atomic write: write to temp file, then rename
+        tmp = HISTORY_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(history, f, indent=2)
+        os.replace(tmp, HISTORY_FILE)
+
+def mark_processed(history, link):
+    """Thread-safe: mark a single link as processed and flush to disk."""
+    with _history_lock:
+        history[link] = datetime.now().isoformat()
+        tmp = HISTORY_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(history, f, indent=2)
+        os.replace(tmp, HISTORY_FILE)
 
 def is_recently_processed(link, history):
     if link in history:
@@ -407,8 +422,8 @@ def generate_intelligence_report(api_key, sources):
         }
         report.append(entry)
 
-        # Mark as processed
-        history[news_link] = datetime.now().isoformat()
+        # Mark as processed (thread-safe, flushed to disk immediately)
+        mark_processed(history, news_link)
 
         if headline_analysis.get("mint_decision"):
             ticker = coin_meta.get('suggested_ticker', '$UNKNOWN')
@@ -459,9 +474,6 @@ def generate_intelligence_report(api_key, sources):
                     future.result()
                 except Exception as e:
                     print(f"❌ Deployment failed for {ticker}: {e}")
-
-    # Save history once at the end (not after every item)
-    save_history(history)
 
     total_time = time.time() - cycle_start
     mints = sum(1 for r in report if r['analysis'].get('mint_decision'))

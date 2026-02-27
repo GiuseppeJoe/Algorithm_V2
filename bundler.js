@@ -112,7 +112,24 @@ function toKeypair(walletData) {
 }
 
 // =============================================================
-// PHASE 2: FUND WALLETS
+// RETRY HELPER
+// =============================================================
+
+async function withRetry(fn, { retries = 3, baseDelay = 1000, label = '' } = {}) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            return await fn();
+        } catch (err) {
+            if (attempt === retries) throw err;
+            const delay = baseDelay * Math.pow(2, attempt);
+            console.log(`   [retry] ${label} attempt ${attempt + 1} failed: ${err.message} — retrying in ${delay}ms`);
+            await new Promise(r => setTimeout(r, delay));
+        }
+    }
+}
+
+// =============================================================
+// PHASE 2: FUND WALLETS (fire-all-then-confirm)
 // =============================================================
 
 async function fundWallets(connection, mainKeypair, walletDataList, solPerWallet) {
@@ -133,8 +150,10 @@ async function fundWallets(connection, mainKeypair, walletDataList, solPerWallet
         );
     }
 
-    // Batch SOL transfers (~20 per tx due to size limits)
+    // Build all funding txs, send them all, then confirm in parallel
     const BATCH_SIZE = 20;
+    const pendingSigs = [];
+
     for (let i = 0; i < walletDataList.length; i += BATCH_SIZE) {
         const batch = walletDataList.slice(i, i + BATCH_SIZE);
         const instructions = batch.map(w =>
@@ -145,19 +164,28 @@ async function fundWallets(connection, mainKeypair, walletDataList, solPerWallet
             })
         );
 
-        const { blockhash } = await connection.getLatestBlockhash('confirmed');
-        const msgV0 = new TransactionMessage({
-            payerKey: mainKeypair.publicKey,
-            recentBlockhash: blockhash,
-            instructions,
-        }).compileToV0Message();
-        const vTx = new VersionedTransaction(msgV0);
-        vTx.sign([mainKeypair]);
+        const sig = await withRetry(async () => {
+            const { blockhash } = await connection.getLatestBlockhash('confirmed');
+            const msgV0 = new TransactionMessage({
+                payerKey: mainKeypair.publicKey,
+                recentBlockhash: blockhash,
+                instructions,
+            }).compileToV0Message();
+            const vTx = new VersionedTransaction(msgV0);
+            vTx.sign([mainKeypair]);
+            return await connection.sendTransaction(vTx, { skipPreflight: false });
+        }, { label: `fund batch ${i + 1}-${i + batch.length}` });
 
-        const sig = await connection.sendTransaction(vTx, { skipPreflight: false });
-        await connection.confirmTransaction(sig, 'confirmed');
-        console.log(`   Funded wallets ${i + 1}-${i + batch.length}: ${sig}`);
+        console.log(`   Sent funding tx for wallets ${i + 1}-${i + batch.length}: ${sig}`);
+        pendingSigs.push({ sig, start: i + 1, end: i + batch.length });
     }
+
+    // Confirm all funding txs in parallel
+    console.log(`   Confirming ${pendingSigs.length} funding tx(s)...`);
+    await Promise.all(pendingSigs.map(async ({ sig, start, end }) => {
+        await connection.confirmTransaction(sig, 'confirmed');
+        console.log(`   Confirmed wallets ${start}-${end}: ${sig}`);
+    }));
 
     console.log(`   All ${walletDataList.length} wallets funded.`);
 }
@@ -192,7 +220,6 @@ function pickTipAccount() {
 async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, walletKeypairs, metadataUri, buyAmountSol) {
     console.log(`\n[PHASE 4] Building Jito bundles...`);
 
-    const { blockhash } = await connection.getLatestBlockhash('finalized');
     const globalAccount = await sdk.getGlobalAccount('confirmed');
     const feeRecipient = globalAccount.feeRecipient;
 
@@ -237,6 +264,10 @@ async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, wallet
     for (let bi = 0; bi < bundleGroups.length; bi++) {
         const group = bundleGroups[bi];
         const serializedTxs = [];
+
+        // Fresh blockhash per bundle — prevents stale-blockhash rejection
+        // on later bundles when build time exceeds ~60s
+        const { blockhash } = await connection.getLatestBlockhash('finalized');
 
         // BUILD CREATE TX (only in first bundle)
         if (group.includeCreate) {
@@ -378,7 +409,10 @@ async function submitAllBundles(allBundles) {
         const bundle = allBundles[i];
         console.log(`   Submitting bundle ${i + 1}/${allBundles.length} (${bundle.length} txs)...`);
 
-        const bundleId = await submitJitoBundle(bundle);
+        const bundleId = await withRetry(
+            () => submitJitoBundle(bundle),
+            { label: `Jito bundle ${i + 1}`, retries: 2, baseDelay: 500 }
+        );
         bundleIds.push(bundleId);
         console.log(`   Bundle ${i + 1} accepted: ${bundleId}`);
 
@@ -392,28 +426,40 @@ async function submitAllBundles(allBundles) {
 }
 
 async function waitForBundles(bundleIds) {
-    console.log(`\n[PHASE 6] Waiting for bundle confirmation...`);
-    const maxAttempts = 30;
+    console.log(`\n[PHASE 6] Waiting for ${bundleIds.length} bundle(s) to confirm...`);
+    const maxAttempts = 40;
+    const confirmed = new Set();
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
         await new Promise(r => setTimeout(r, 2000));
 
-        // Check the first bundle (the one with the create tx)
-        const status = await checkBundleStatus(bundleIds[0]);
-        if (status) {
-            const confirmation = status.confirmation_status;
-            if (confirmation === 'confirmed' || confirmation === 'finalized') {
-                console.log(`   Bundle 1 ${confirmation}! Slot: ${status.slot}`);
-                return true;
+        for (let i = 0; i < bundleIds.length; i++) {
+            if (confirmed.has(i)) continue;
+
+            const status = await checkBundleStatus(bundleIds[i]);
+            if (status) {
+                const confirmation = status.confirmation_status;
+                if (confirmation === 'confirmed' || confirmation === 'finalized') {
+                    console.log(`   Bundle ${i + 1} ${confirmation}! Slot: ${status.slot}`);
+                    confirmed.add(i);
+                } else if (status.err) {
+                    console.error(`   Bundle ${i + 1} failed:`, status.err);
+                    return false;
+                }
             }
-            if (status.err) {
-                console.error(`   Bundle 1 failed:`, status.err);
-                return false;
-            }
-            console.log(`   Attempt ${attempt + 1}: status = ${confirmation || 'pending'}...`);
-        } else {
-            console.log(`   Attempt ${attempt + 1}: awaiting landing...`);
         }
+
+        if (confirmed.size === bundleIds.length) {
+            console.log(`   All ${bundleIds.length} bundle(s) confirmed.`);
+            return true;
+        }
+
+        console.log(`   Attempt ${attempt + 1}: ${confirmed.size}/${bundleIds.length} confirmed...`);
+    }
+
+    if (confirmed.has(0)) {
+        console.log(`   WARNING: Bundle 1 (create) confirmed but ${bundleIds.length - confirmed.size} buy bundle(s) timed out.`);
+        return true; // Token was created, some buys may have landed
     }
 
     console.error(`   Timed out waiting for bundle confirmation.`);
