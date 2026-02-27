@@ -7,6 +7,7 @@
 //
 // Usage:
 //   node sweep.js                          # sweep bundle_wallets/latest.json
+//   node sweep.js --all                    # sweep ALL bundle_wallets*/latest.json
 //   node sweep.js bundle_wallets/wallets_2025-02-25T07-25-17-234Z.json
 //   node sweep.js --dry-run                # preview balances without sending
 //   node sweep.js --tokens-only            # only sweep SPL tokens, keep SOL
@@ -37,14 +38,17 @@ if (!RPC_ENDPOINT) {
     process.exit(1);
 }
 
+const path = require('path');
+
 const DRY_RUN = process.argv.includes("--dry-run");
 const TOKENS_ONLY = process.argv.includes("--tokens-only");
 const SOL_ONLY = process.argv.includes("--sol-only");
+const SWEEP_ALL = process.argv.includes("--all");
 
 const TX_FEE = 5000; // lamports per signature
 const SWEEP_CONCURRENCY = parseInt(process.env.SWEEP_CONCURRENCY || "5");
 
-// Find wallet file from CLI args
+// Find wallet file from CLI args (ignored when --all is used)
 const walletFile = process.argv.slice(2).find(a => !a.startsWith('--')) || "bundle_wallets/latest.json";
 
 function toKeypair(walletData) {
@@ -306,61 +310,122 @@ async function sweepTokens(connection, mainKeypair, walletData) {
 }
 
 // =============================================================
+// DISCOVER WALLET FILES (--all mode)
+// =============================================================
+
+function discoverWalletFiles() {
+    const files = [];
+    const cwd = process.cwd();
+
+    // Find all bundle_wallets* directories
+    const entries = fs.readdirSync(cwd, { withFileTypes: true });
+    for (const entry of entries) {
+        if (entry.isDirectory() && entry.name.startsWith('bundle_wallets')) {
+            const dir = path.join(cwd, entry.name);
+            // Collect latest.json and any archived wallet files
+            const jsonFiles = fs.readdirSync(dir).filter(f => f.endsWith('.json'));
+            for (const f of jsonFiles) {
+                files.push(path.join(dir, f));
+            }
+        }
+    }
+
+    return files;
+}
+
+// =============================================================
+// SWEEP ONE WALLET FILE
+// =============================================================
+
+async function sweepWalletFile(filePath, connection, mainKeypair) {
+    console.log(`\n--- Sweeping: ${filePath} ---`);
+
+    const walletData = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    if (!Array.isArray(walletData) || walletData.length === 0) {
+        console.log(`   Skipping: empty or invalid wallet file`);
+        return 0;
+    }
+    console.log(`   ${walletData.length} wallets`);
+
+    let solRecovered = 0;
+
+    // Tokens first (they need SOL in the wallet for tx fees)
+    if (!SOL_ONLY) {
+        await sweepTokens(connection, mainKeypair, walletData);
+    }
+
+    // Then SOL (after tokens are moved and ATAs closed)
+    if (!TOKENS_ONLY) {
+        solRecovered = await sweepSol(connection, mainKeypair, walletData);
+    }
+
+    return solRecovered;
+}
+
+// =============================================================
 // MAIN
 // =============================================================
 
 async function main() {
-    console.log(`\n========================================`);
-    console.log(`  SWEEP: Recover funds from bundle wallets`);
-    console.log(`  File:  ${walletFile}`);
-    if (DRY_RUN) console.log(`  MODE:  DRY RUN (preview only)`);
-    if (TOKENS_ONLY) console.log(`  SCOPE: Tokens only`);
-    if (SOL_ONLY) console.log(`  SCOPE: SOL only`);
-    console.log(`========================================`);
-
     // Load main wallet
     const privateKeyString = process.env.SOLANA_PRIVATE_KEY;
     if (!privateKeyString) { console.error("FAILURE: SOLANA_PRIVATE_KEY missing."); process.exit(1); }
 
     const connection = new Connection(RPC_ENDPOINT, 'confirmed');
     const mainKeypair = Keypair.fromSecretKey(bs58.decode(privateKeyString));
-    console.log(`   Main wallet: ${mainKeypair.publicKey.toBase58()}`);
 
-    // Load bundle wallets
-    if (!fs.existsSync(walletFile)) {
-        console.error(`FAILURE: Wallet file not found: ${walletFile}`);
-        console.error(`Available wallet files:`);
-        const dir = walletFile.includes('/') ? walletFile.split('/').slice(0, -1).join('/') : 'bundle_wallets';
-        if (fs.existsSync(dir)) {
-            fs.readdirSync(dir).filter(f => f.endsWith('.json')).forEach(f => console.error(`  ${dir}/${f}`));
+    // Determine which wallet files to sweep
+    let walletFiles;
+    if (SWEEP_ALL) {
+        walletFiles = discoverWalletFiles();
+        if (walletFiles.length === 0) {
+            console.error("FAILURE: No bundle_wallets* directories found.");
+            process.exit(1);
         }
-        process.exit(1);
+    } else {
+        if (!fs.existsSync(walletFile)) {
+            console.error(`FAILURE: Wallet file not found: ${walletFile}`);
+            console.error(`Available wallet files:`);
+            const dir = walletFile.includes('/') ? walletFile.split('/').slice(0, -1).join('/') : 'bundle_wallets';
+            if (fs.existsSync(dir)) {
+                fs.readdirSync(dir).filter(f => f.endsWith('.json')).forEach(f => console.error(`  ${dir}/${f}`));
+            }
+            console.error(`\nTip: use --all to sweep every bundle_wallets* directory at once.`);
+            process.exit(1);
+        }
+        walletFiles = [walletFile];
     }
 
-    const walletData = JSON.parse(fs.readFileSync(walletFile, 'utf8'));
-    console.log(`   Bundle wallets: ${walletData.length}`);
+    console.log(`\n========================================`);
+    console.log(`  SWEEP: Recover funds from bundle wallets`);
+    console.log(`  Files: ${walletFiles.length} wallet file(s)`);
+    if (SWEEP_ALL) console.log(`  MODE:  --all (sweep every bundle_wallets* directory)`);
+    if (DRY_RUN) console.log(`  MODE:  DRY RUN (preview only)`);
+    if (TOKENS_ONLY) console.log(`  SCOPE: Tokens only`);
+    if (SOL_ONLY) console.log(`  SCOPE: SOL only`);
+    console.log(`========================================`);
+    console.log(`   Main wallet: ${mainKeypair.publicKey.toBase58()}`);
 
-    // Check main wallet balance
     const mainBalance = await connection.getBalance(mainKeypair.publicKey);
     console.log(`   Main wallet balance: ${(mainBalance / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
 
-    let totalSolRecovered = 0;
-
-    // Phase 1: Sweep tokens first (they need SOL in the wallet for tx fees)
-    if (!SOL_ONLY) {
-        await sweepTokens(connection, mainKeypair, walletData);
+    if (SWEEP_ALL) {
+        console.log(`\n   Wallet files to sweep:`);
+        walletFiles.forEach(f => console.log(`     ${path.relative(process.cwd(), f)}`));
     }
 
-    // Phase 2: Sweep remaining SOL (after tokens are moved and ATAs closed)
-    if (!TOKENS_ONLY) {
-        totalSolRecovered = await sweepSol(connection, mainKeypair, walletData);
+    let grandTotalSol = 0;
+    for (const file of walletFiles) {
+        const recovered = await sweepWalletFile(file, connection, mainKeypair);
+        grandTotalSol += recovered;
     }
 
     // Final summary
     const newBalance = DRY_RUN ? mainBalance : await connection.getBalance(mainKeypair.publicKey);
     console.log(`\n========================================`);
     console.log(`  SWEEP COMPLETE${DRY_RUN ? ' (DRY RUN)' : ''}`);
-    console.log(`  SOL recovered:    ${(totalSolRecovered / LAMPORTS_PER_SOL).toFixed(6)} SOL`);
+    if (walletFiles.length > 1) console.log(`  Files swept:    ${walletFiles.length}`);
+    console.log(`  SOL recovered:    ${(grandTotalSol / LAMPORTS_PER_SOL).toFixed(6)} SOL`);
     console.log(`  Main wallet now:  ${(newBalance / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
     console.log(`========================================\n`);
 }
