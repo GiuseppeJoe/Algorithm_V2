@@ -430,10 +430,12 @@ async function submitAllBundles(allBundles) {
 
 async function waitForBundles(bundleIds) {
     console.log(`\n[PHASE 6] Waiting for ${bundleIds.length} bundle(s) to confirm...`);
-    const maxAttempts = 40;
+    const maxAttempts = 30; // 60s max — if it hasn't landed by then, retry with higher tip
     const confirmed = new Set();
     const failed = new Set();
-    const lastStatus = {}; // track last known status per bundle for diagnostics
+    const lastStatus = {};
+    const noStatusCount = {}; // track consecutive null responses per bundle
+    bundleIds.forEach((_, i) => { noStatusCount[i] = 0; });
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
         await new Promise(r => setTimeout(r, 2000));
@@ -444,6 +446,7 @@ async function waitForBundles(bundleIds) {
             try {
                 const status = await checkBundleStatus(bundleIds[i]);
                 if (status) {
+                    noStatusCount[i] = 0;
                     lastStatus[i] = status;
                     const confirmation = status.confirmation_status;
 
@@ -459,9 +462,16 @@ async function waitForBundles(bundleIds) {
                         }
                         failed.add(i);
                     }
+                } else {
+                    noStatusCount[i]++;
+                    // If Jito returns no status for 10+ consecutive checks (~20s),
+                    // the bundle was dropped — no point waiting the full timeout
+                    if (noStatusCount[i] >= 10) {
+                        console.error(`   Bundle ${i + 1}: no status after ${noStatusCount[i]} checks — Jito dropped it (tip too low)`);
+                        failed.add(i);
+                    }
                 }
             } catch (e) {
-                // Jito status check failed — don't abort, just log
                 if (attempt % 5 === 0) {
                     console.log(`   Bundle ${i + 1} status check error: ${e.message}`);
                 }
@@ -473,12 +483,17 @@ async function waitForBundles(bundleIds) {
             return true;
         }
 
-        if (failed.size > 0 && failed.has(0)) {
-            console.error(`   Bundle 1 (create) failed — aborting.`);
+        // If create bundle failed or was dropped, abort immediately
+        if (failed.has(0)) {
+            console.error(`   Bundle 1 (create) failed/dropped — aborting to retry with higher tip.`);
             return false;
         }
 
-        // Show progress every 5 attempts with more detail
+        // If ALL bundles failed, no point waiting
+        if (confirmed.size + failed.size === bundleIds.length && failed.size > 0) {
+            return confirmed.has(0);
+        }
+
         if (attempt % 5 === 0 || attempt === maxAttempts - 1) {
             const pending = bundleIds.length - confirmed.size - failed.size;
             console.log(`   Attempt ${attempt + 1}/${maxAttempts}: ${confirmed.size} confirmed, ${failed.size} failed, ${pending} pending`);
@@ -496,14 +511,14 @@ async function waitForBundles(bundleIds) {
             if (s) {
                 console.error(`   Bundle ${i + 1} (${bundleIds[i]}): last status = ${s.confirmation_status || 'unknown'}`);
             } else {
-                console.error(`   Bundle ${i + 1} (${bundleIds[i]}): no status returned (Jito may have dropped it — tip too low?)`);
+                console.error(`   Bundle ${i + 1} (${bundleIds[i]}): no status returned — Jito dropped it (tip too low)`);
             }
         }
     }
 
     if (confirmed.has(0)) {
         console.log(`\n   WARNING: Bundle 1 (create) confirmed but ${bundleIds.length - confirmed.size} buy bundle(s) timed out.`);
-        return true; // Token was created, some buys may have landed
+        return true;
     }
 
     return false;
