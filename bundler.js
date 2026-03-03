@@ -51,7 +51,7 @@ const JITO_TIP_ACCOUNTS = [
 // Tunable parameters (override via .env)
 const NUM_WALLETS = parseInt(process.env.BUNDLE_WALLET_COUNT || "20");
 const BUY_SOL_PER_WALLET = parseFloat(process.env.BUNDLE_BUY_SOL || "0.001");
-const JITO_TIP_LAMPORTS = parseInt(process.env.JITO_TIP_LAMPORTS || "100000"); // 0.0001 SOL
+const JITO_TIP_LAMPORTS = parseInt(process.env.JITO_TIP_LAMPORTS || "1000000"); // 0.001 SOL
 const SLIPPAGE_BPS = 2500n; // 25% slippage for bundled buys
 const MAX_TXS_PER_BUNDLE = 5;
 const DRY_RUN = process.argv.includes("--dry-run");
@@ -220,8 +220,8 @@ function pickTipAccount() {
     return new PublicKey(JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]);
 }
 
-async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, walletKeypairs, metadataUri, buyAmountSol) {
-    console.log(`\n[PHASE 4] Building Jito bundles...`);
+async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, walletKeypairs, metadataUri, buyAmountSol, tipLamports = JITO_TIP_LAMPORTS) {
+    console.log(`\n[PHASE 4] Building Jito bundles (tip: ${(tipLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL)...`);
 
     const globalAccount = await sdk.getGlobalAccount('confirmed');
     const feeRecipient = globalAccount.feeRecipient;
@@ -290,7 +290,7 @@ async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, wallet
                     SystemProgram.transfer({
                         fromPubkey: mainKeypair.publicKey,
                         toPubkey: pickTipAccount(),
-                        lamports: JITO_TIP_LAMPORTS,
+                        lamports: tipLamports,
                     })
                 );
             }
@@ -343,7 +343,7 @@ async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, wallet
                     SystemProgram.transfer({
                         fromPubkey: buyer.publicKey,
                         toPubkey: pickTipAccount(),
-                        lamports: JITO_TIP_LAMPORTS,
+                        lamports: tipLamports,
                     })
                 );
             }
@@ -432,22 +432,38 @@ async function waitForBundles(bundleIds) {
     console.log(`\n[PHASE 6] Waiting for ${bundleIds.length} bundle(s) to confirm...`);
     const maxAttempts = 40;
     const confirmed = new Set();
+    const failed = new Set();
+    const lastStatus = {}; // track last known status per bundle for diagnostics
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
         await new Promise(r => setTimeout(r, 2000));
 
         for (let i = 0; i < bundleIds.length; i++) {
-            if (confirmed.has(i)) continue;
+            if (confirmed.has(i) || failed.has(i)) continue;
 
-            const status = await checkBundleStatus(bundleIds[i]);
-            if (status) {
-                const confirmation = status.confirmation_status;
-                if (confirmation === 'confirmed' || confirmation === 'finalized') {
-                    console.log(`   Bundle ${i + 1} ${confirmation}! Slot: ${status.slot}`);
-                    confirmed.add(i);
-                } else if (status.err) {
-                    console.error(`   Bundle ${i + 1} failed:`, status.err);
-                    return false;
+            try {
+                const status = await checkBundleStatus(bundleIds[i]);
+                if (status) {
+                    lastStatus[i] = status;
+                    const confirmation = status.confirmation_status;
+
+                    if (confirmation === 'confirmed' || confirmation === 'finalized') {
+                        console.log(`   Bundle ${i + 1} ${confirmation}! Slot: ${status.slot}`);
+                        confirmed.add(i);
+                    } else if (status.err) {
+                        console.error(`   Bundle ${i + 1} FAILED:`, JSON.stringify(status.err));
+                        if (status.transactions) {
+                            status.transactions.forEach((tx, ti) => {
+                                if (tx?.err) console.error(`     TX ${ti + 1} error:`, JSON.stringify(tx.err));
+                            });
+                        }
+                        failed.add(i);
+                    }
+                }
+            } catch (e) {
+                // Jito status check failed — don't abort, just log
+                if (attempt % 5 === 0) {
+                    console.log(`   Bundle ${i + 1} status check error: ${e.message}`);
                 }
             }
         }
@@ -457,15 +473,39 @@ async function waitForBundles(bundleIds) {
             return true;
         }
 
-        console.log(`   Attempt ${attempt + 1}: ${confirmed.size}/${bundleIds.length} confirmed...`);
+        if (failed.size > 0 && failed.has(0)) {
+            console.error(`   Bundle 1 (create) failed — aborting.`);
+            return false;
+        }
+
+        // Show progress every 5 attempts with more detail
+        if (attempt % 5 === 0 || attempt === maxAttempts - 1) {
+            const pending = bundleIds.length - confirmed.size - failed.size;
+            console.log(`   Attempt ${attempt + 1}/${maxAttempts}: ${confirmed.size} confirmed, ${failed.size} failed, ${pending} pending`);
+        } else {
+            console.log(`   Attempt ${attempt + 1}: ${confirmed.size}/${bundleIds.length} confirmed...`);
+        }
+    }
+
+    // Timeout — show diagnostics
+    console.error(`\n   BUNDLE LANDING FAILED — timed out after ${maxAttempts * 2}s`);
+    console.error(`   Tip may be too low — increase JITO_TIP_LAMPORTS in .env or let auto-retry escalate`);
+    for (let i = 0; i < bundleIds.length; i++) {
+        if (!confirmed.has(i)) {
+            const s = lastStatus[i];
+            if (s) {
+                console.error(`   Bundle ${i + 1} (${bundleIds[i]}): last status = ${s.confirmation_status || 'unknown'}`);
+            } else {
+                console.error(`   Bundle ${i + 1} (${bundleIds[i]}): no status returned (Jito may have dropped it — tip too low?)`);
+            }
+        }
     }
 
     if (confirmed.has(0)) {
-        console.log(`   WARNING: Bundle 1 (create) confirmed but ${bundleIds.length - confirmed.size} buy bundle(s) timed out.`);
+        console.log(`\n   WARNING: Bundle 1 (create) confirmed but ${bundleIds.length - confirmed.size} buy bundle(s) timed out.`);
         return true; // Token was created, some buys may have landed
     }
 
-    console.error(`   Timed out waiting for bundle confirmation.`);
     return false;
 }
 
@@ -646,21 +686,43 @@ async function main() {
         // PHASE 3: Upload metadata to IPFS
         const metadataUri = await uploadMetadata(sdk);
 
-        // PHASE 4: Build bundles
+        // PHASES 4-6: Build, submit, and confirm bundles
+        // Retries with escalating Jito tip if bundle fails to land
+        const MAX_LANDING_ATTEMPTS = 3;
+        const TIP_MULTIPLIER = 2; // double tip on each retry
         const mintKeypair = Keypair.generate();
         console.log(`MINT_ADDRESS: ${mintKeypair.publicKey.toBase58()}`);
-
         const walletKeypairs = walletData.map(toKeypair);
-        const allBundles = await buildAllBundles(
-            connection, sdk, mainKeypair, mintKeypair,
-            walletKeypairs, metadataUri, BUY_SOL_PER_WALLET
-        );
 
-        // PHASE 5: Submit bundles to Jito
-        const bundleIds = await submitAllBundles(allBundles);
+        let currentTip = JITO_TIP_LAMPORTS;
+        let success = false;
+        let lastBundleIds = [];
 
-        // PHASE 6: Wait for confirmation
-        const success = await waitForBundles(bundleIds);
+        for (let landingAttempt = 0; landingAttempt < MAX_LANDING_ATTEMPTS; landingAttempt++) {
+            if (landingAttempt > 0) {
+                currentTip = Math.floor(currentTip * TIP_MULTIPLIER);
+                console.log(`\n[RETRY ${landingAttempt}/${MAX_LANDING_ATTEMPTS - 1}] Rebuilding bundles with higher tip: ${(currentTip / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+            }
+
+            // PHASE 4: Build bundles (with current tip level)
+            const allBundles = await buildAllBundles(
+                connection, sdk, mainKeypair, mintKeypair,
+                walletKeypairs, metadataUri, BUY_SOL_PER_WALLET,
+                currentTip
+            );
+
+            // PHASE 5: Submit bundles to Jito
+            lastBundleIds = await submitAllBundles(allBundles);
+
+            // PHASE 6: Wait for confirmation
+            success = await waitForBundles(lastBundleIds);
+
+            if (success) break;
+
+            if (landingAttempt < MAX_LANDING_ATTEMPTS - 1) {
+                console.log(`   Bundle didn't land. Will retry with ${(currentTip * TIP_MULTIPLIER / LAMPORTS_PER_SOL).toFixed(4)} SOL tip...`);
+            }
+        }
 
         if (success) {
             console.log(`\n========================================`);
@@ -668,12 +730,13 @@ async function main() {
             console.log(`  Mint:    ${mintKeypair.publicKey.toBase58()}`);
             console.log(`  URL:     https://pump.fun/${mintKeypair.publicKey.toBase58()}`);
             console.log(`  Wallets: ${NUM_WALLETS} bought ${BUY_SOL_PER_WALLET} SOL each`);
-            console.log(`  Bundles: ${bundleIds.join(', ')}`);
+            console.log(`  Tip:     ${(currentTip / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+            console.log(`  Bundles: ${lastBundleIds.join(', ')}`);
             console.log(`========================================\n`);
             console.log(`BUNDLE_WALLETS: ${NUM_WALLETS}`);
-            console.log(`BUNDLE_IDS: ${bundleIds.join(',')}`);
+            console.log(`BUNDLE_IDS: ${lastBundleIds.join(',')}`);
         } else {
-            console.error(`\nBUNDLE LANDING FAILED — token may or may not have been created.`);
+            console.error(`\nBUNDLE LANDING FAILED after ${MAX_LANDING_ATTEMPTS} attempts (final tip: ${(currentTip / LAMPORTS_PER_SOL).toFixed(4)} SOL)`);
             console.log(`MINT_ADDRESS: ${mintKeypair.publicKey.toBase58()}`);
             console.log(`Check: https://solscan.io/account/${mintKeypair.publicKey.toBase58()}`);
             process.exit(1);
