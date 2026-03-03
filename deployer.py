@@ -4,7 +4,7 @@ import os
 import re
 import uuid
 
-def launch_on_pump_fun(name, ticker, description, image_prompt="", bundled=False, deploy_id=None):
+def launch_on_pump_fun(name, ticker, description, image_prompt="", bundled=False, deploy_id=None, simulate=False):
     """
     Deploy a coin to pump.fun.
 
@@ -14,6 +14,8 @@ def launch_on_pump_fun(name, ticker, description, image_prompt="", bundled=False
 
     deploy_id: Unique ID for this deployment. When running multiple deploys
     in parallel, each gets its own isolated payload/image/wallet files.
+    simulate: If True (bundled mode only), runs the full pipeline without
+    spending SOL. Validates wallet gen, tx construction, and bundle building.
     """
     if deploy_id is None:
         deploy_id = uuid.uuid4().hex[:8]
@@ -34,10 +36,13 @@ def launch_on_pump_fun(name, ticker, description, image_prompt="", bundled=False
         json.dump(payload, f, ensure_ascii=False)
 
     script = "bundler.js" if bundled else "deploy.js"
+    cmd = ["node", script, payload_file, "--deploy-id", deploy_id]
+    if simulate and bundled:
+        cmd.append("--simulate")
 
     try:
         result = subprocess.run(
-            ["node", script, payload_file, "--deploy-id", deploy_id],
+            cmd,
             capture_output=True,
             text=True,
             check=False,
