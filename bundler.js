@@ -337,11 +337,12 @@ async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, wallet
                 .instruction();
             buyInstructions.push(buyIx);
 
-            // Jito tip on the last tx of each bundle
+            // Jito tip on the last tx of each bundle — paid by main wallet
+            // (buyer wallets are only funded for buy + ATA rent, not enough for tip)
             if (isLastInBundle) {
                 buyInstructions.push(
                     SystemProgram.transfer({
-                        fromPubkey: buyer.publicKey,
+                        fromPubkey: mainKeypair.publicKey,
                         toPubkey: pickTipAccount(),
                         lamports: tipLamports,
                     })
@@ -354,7 +355,8 @@ async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, wallet
                 instructions: buyInstructions,
             }).compileToV0Message();
             const signedBuy = new VersionedTransaction(buyMsg);
-            signedBuy.sign([buyer]);
+            // Main wallet must co-sign last tx (it pays the Jito tip)
+            signedBuy.sign(isLastInBundle ? [buyer, mainKeypair] : [buyer]);
             serializedTxs.push(signedBuy.serialize());
         }
 
