@@ -403,7 +403,30 @@ async function checkBundleStatus(bundleId) {
         }),
     });
     const result = await response.json();
+    if (result.error) {
+        // Return a sentinel so callers can distinguish API errors from "no status"
+        return { _jitoError: true, error: result.error };
+    }
     return result.result?.value?.[0] || null;
+}
+
+async function checkInflightBundleStatus(bundleId) {
+    try {
+        const response = await fetch(JITO_BLOCK_ENGINE_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'getInflightBundleStatuses',
+                params: [[bundleId]],
+            }),
+        });
+        const result = await response.json();
+        return result.result?.value?.[0] || null;
+    } catch {
+        return null;
+    }
 }
 
 async function submitAllBundles(allBundles) {
@@ -432,12 +455,13 @@ async function submitAllBundles(allBundles) {
 
 async function waitForBundles(bundleIds) {
     console.log(`\n[PHASE 6] Waiting for ${bundleIds.length} bundle(s) to confirm...`);
-    const maxAttempts = 30; // 60s max — if it hasn't landed by then, retry with higher tip
+    const maxAttempts = 30; // 60s max
     const confirmed = new Set();
     const failed = new Set();
     const lastStatus = {};
-    const noStatusCount = {}; // track consecutive null responses per bundle
-    bundleIds.forEach((_, i) => { noStatusCount[i] = 0; });
+    const noStatusCount = {}; // track consecutive genuine null responses (not errors)
+    const errorCount = {};    // track consecutive API errors separately
+    bundleIds.forEach((_, i) => { noStatusCount[i] = 0; errorCount[i] = 0; });
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
         await new Promise(r => setTimeout(r, 2000));
@@ -447,8 +471,19 @@ async function waitForBundles(bundleIds) {
 
             try {
                 const status = await checkBundleStatus(bundleIds[i]);
+
+                // Jito API returned an error (rate limit, etc.) — don't count as "no status"
+                if (status && status._jitoError) {
+                    errorCount[i]++;
+                    if (errorCount[i] % 5 === 1) {
+                        console.log(`   Bundle ${i + 1}: Jito API error (${errorCount[i]}x): ${status.error.message || JSON.stringify(status.error)}`);
+                    }
+                    continue;
+                }
+
                 if (status) {
                     noStatusCount[i] = 0;
+                    errorCount[i] = 0;
                     lastStatus[i] = status;
                     const confirmation = status.confirmation_status;
 
@@ -466,14 +501,26 @@ async function waitForBundles(bundleIds) {
                     }
                 } else {
                     noStatusCount[i]++;
-                    // If Jito returns no status for 10+ consecutive checks (~20s),
-                    // the bundle was dropped — no point waiting the full timeout
-                    if (noStatusCount[i] >= 10) {
-                        console.error(`   Bundle ${i + 1}: no status after ${noStatusCount[i]} checks — Jito dropped it (tip too low)`);
+
+                    // Before declaring dropped, check if it's still in Jito's queue
+                    if (noStatusCount[i] >= 8) {
+                        const inflight = await checkInflightBundleStatus(bundleIds[i]);
+                        if (inflight) {
+                            console.log(`   Bundle ${i + 1}: still in Jito queue (status: ${inflight.status || 'pending'}) — continuing to wait`);
+                            noStatusCount[i] = 0; // reset — it's still alive
+                            continue;
+                        }
+                    }
+
+                    // Only declare dropped after 15 genuine no-status responses (~30s)
+                    // and no inflight status
+                    if (noStatusCount[i] >= 15) {
+                        console.error(`   Bundle ${i + 1}: no status after ${noStatusCount[i]} checks — Jito dropped it`);
                         failed.add(i);
                     }
                 }
             } catch (e) {
+                errorCount[i]++;
                 if (attempt % 5 === 0) {
                     console.log(`   Bundle ${i + 1} status check error: ${e.message}`);
                 }
@@ -506,14 +553,15 @@ async function waitForBundles(bundleIds) {
 
     // Timeout — show diagnostics
     console.error(`\n   BUNDLE LANDING FAILED — timed out after ${maxAttempts * 2}s`);
-    console.error(`   Tip may be too low — increase JITO_TIP_LAMPORTS in .env or let auto-retry escalate`);
     for (let i = 0; i < bundleIds.length; i++) {
         if (!confirmed.has(i)) {
             const s = lastStatus[i];
             if (s) {
                 console.error(`   Bundle ${i + 1} (${bundleIds[i]}): last status = ${s.confirmation_status || 'unknown'}`);
+            } else if (errorCount[i] > 0) {
+                console.error(`   Bundle ${i + 1} (${bundleIds[i]}): ${errorCount[i]} API errors — Jito may have been rate-limiting status checks`);
             } else {
-                console.error(`   Bundle ${i + 1} (${bundleIds[i]}): no status returned — Jito dropped it (tip too low)`);
+                console.error(`   Bundle ${i + 1} (${bundleIds[i]}): no status returned — Jito dropped it`);
             }
         }
     }
@@ -717,6 +765,20 @@ async function main() {
 
         for (let landingAttempt = 0; landingAttempt < MAX_LANDING_ATTEMPTS; landingAttempt++) {
             if (landingAttempt > 0) {
+                // Before retrying, check if the mint already exists on-chain
+                // (previous bundle may have landed even though Jito didn't report it)
+                try {
+                    const mintInfo = await connection.getAccountInfo(mintKeypair.publicKey);
+                    if (mintInfo) {
+                        console.log(`   Mint account EXISTS on-chain — previous bundle DID land!`);
+                        console.log(`   Jito status API failed to report it (likely rate-limited).`);
+                        success = true;
+                        break;
+                    }
+                } catch (e) {
+                    // Non-fatal — proceed with retry
+                }
+
                 currentTip = Math.floor(currentTip * TIP_MULTIPLIER);
                 console.log(`\n[RETRY ${landingAttempt}/${MAX_LANDING_ATTEMPTS - 1}] Rebuilding bundles with higher tip: ${(currentTip / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
             }
@@ -738,6 +800,19 @@ async function main() {
 
             if (landingAttempt < MAX_LANDING_ATTEMPTS - 1) {
                 console.log(`   Bundle didn't land. Will retry with ${(currentTip * TIP_MULTIPLIER / LAMPORTS_PER_SOL).toFixed(4)} SOL tip...`);
+            }
+        }
+
+        // Final on-chain check if all Jito attempts reported failure
+        if (!success) {
+            try {
+                const mintInfo = await connection.getAccountInfo(mintKeypair.publicKey);
+                if (mintInfo) {
+                    console.log(`\n   On-chain check: Mint account EXISTS — a bundle DID land despite Jito not reporting it.`);
+                    success = true;
+                }
+            } catch (e) {
+                // Non-fatal
             }
         }
 
