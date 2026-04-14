@@ -60,17 +60,72 @@ function isRateLimitError(errObj) {
     return msg.includes('rate limit') || msg.includes('network congested');
 }
 
-// Jito tip accounts (official)
-const JITO_TIP_ACCOUNTS = [
+// Jito tip accounts. These are rarely rotated but *are* maintained by Jito,
+// so at runtime we ALSO query `getTipAccounts` and prefer its result. This
+// hardcoded list is the fallback when the API call fails.
+// Verified against https://docs.jito.wtf/lowlatencytxnsend/ (2026-04).
+const JITO_TIP_ACCOUNTS_FALLBACK = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
-    "HFqU5x63VTqvQss8hp11i4bVqkfRtQ7NmXwkiYoYHJMm",
+    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
     "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
-    "ADaUMid9yfUytqMBgopwjb2o3J2AISMwhF6zTKyNBh1R",
+    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
     "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
     "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT"
 ];
+// Populated by initTipAccounts() at startup. pickTipAccount() reads from here.
+let JITO_TIP_ACCOUNTS = JITO_TIP_ACCOUNTS_FALLBACK;
+
+// Matches Solana's base58 alphabet (excludes 0, O, I, l) with 32-44 char length.
+// Used to sanity-check any pubkey string before we trust it (blockhashes, tip
+// accounts, RPC responses). A bad address here causes Jito -32602 or the
+// cryptic "Non-base58 character" error from @solana/web3.js.
+const BASE58_PUBKEY_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+// Query Jito for the live tip-account list. Rotates through regions to
+// shrug off per-region rate limits; times out each request at 5s. Returns
+// `{ source, accounts }` on success, `null` if every region failed or
+// returned a malformed payload. The regex filter means a garbage response
+// can never silently replace our vetted fallback list.
+async function fetchTipAccounts() {
+    for (let i = 0; i < JITO_ENDPOINTS.length; i++) {
+        const ep = nextJitoEndpoint();
+        try {
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), 5000);
+            const res = await fetch(ep.url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    jsonrpc: '2.0', id: 1,
+                    method: 'getTipAccounts', params: []
+                }),
+                signal: ctrl.signal,
+            });
+            clearTimeout(t);
+            const json = await res.json();
+            const list = json && json.result;
+            if (Array.isArray(list) && list.length >= 4 &&
+                list.every(a => typeof a === 'string' && BASE58_PUBKEY_RE.test(a))) {
+                return { source: ep.name, accounts: list };
+            }
+        } catch (_) { /* try next region */ }
+    }
+    return null;
+}
+
+// Must be called before any code path that reaches pickTipAccount().
+async function initTipAccounts() {
+    const live = await fetchTipAccounts();
+    if (live) {
+        JITO_TIP_ACCOUNTS = live.accounts;
+        console.log(`   Jito tip accounts: ${live.accounts.length} fetched from ${live.source}`);
+    } else {
+        JITO_TIP_ACCOUNTS = JITO_TIP_ACCOUNTS_FALLBACK;
+        console.log(`   Jito tip accounts: using hardcoded fallback (${JITO_TIP_ACCOUNTS_FALLBACK.length} addresses) — live fetch failed`);
+    }
+}
 
 // Tunable parameters (override via .env)
 const NUM_WALLETS = parseInt(process.env.BUNDLE_WALLET_COUNT || "20");
@@ -147,6 +202,11 @@ async function withRetry(fn, { retries = 3, baseDelay = 1000, label = '' } = {})
         try {
             return await fn();
         } catch (err) {
+            // Callers can mark errors as non-retryable by setting err.noRetry.
+            // This prevents burning retries on bundles that are globally
+            // invalid (e.g. stale tip account -> Jito -32602) — the outer
+            // landingAttempt loop will rebuild with a fresh tip pick.
+            if (err && err.noRetry) throw err;
             if (attempt === retries) throw err;
             const delay = baseDelay * Math.pow(2, attempt);
             console.log(`   [retry] ${label} attempt ${attempt + 1} failed: ${err.message} — retrying in ${delay}ms`);
@@ -170,10 +230,24 @@ async function fundWallets(connection, mainKeypair, walletDataList, solPerWallet
     console.log(`   Main wallet balance: ${(balance / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
     console.log(`   Funding needed:      ${(totalNeeded / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
 
-    if (balance < totalNeeded + 0.01 * LAMPORTS_PER_SOL) {
+    // Worst-case tip spend: main wallet pays one tip per bundle, and the
+    // landingAttempt loop (main orchestrator) can escalate 2× across 3
+    // attempts — so the peak is numBundles × (1 + 2 + 4) × JITO_TIP_LAMPORTS.
+    // Without this check a late-stage retry with escalated tip could fail
+    // mid-flight when the main wallet runs out of SOL.
+    const firstGroupSize = MAX_TXS_PER_BUNDLE - 1;
+    const remaining = Math.max(0, walletDataList.length - firstGroupSize);
+    const numBundles = 1 + Math.ceil(remaining / MAX_TXS_PER_BUNDLE);
+    const worstCaseTip = JITO_TIP_LAMPORTS * numBundles * (1 + 2 + 4);
+    const buffer = 0.01 * LAMPORTS_PER_SOL + worstCaseTip;
+    console.log(`   Worst-case tip:      ${(worstCaseTip / LAMPORTS_PER_SOL).toFixed(4)} SOL (${numBundles} bundles × 7× escalation)`);
+
+    if (balance < totalNeeded + buffer) {
         throw new Error(
-            `Insufficient balance. Need ~${((totalNeeded + 0.01 * LAMPORTS_PER_SOL) / LAMPORTS_PER_SOL).toFixed(4)} SOL, ` +
-            `have ${(balance / LAMPORTS_PER_SOL).toFixed(4)} SOL`
+            `Insufficient balance. Need ~${((totalNeeded + buffer) / LAMPORTS_PER_SOL).toFixed(4)} SOL ` +
+            `(funding: ${(totalNeeded / LAMPORTS_PER_SOL).toFixed(4)}, ` +
+            `worst-case tips: ${(worstCaseTip / LAMPORTS_PER_SOL).toFixed(4)}, ` +
+            `fees buffer: 0.01), have ${(balance / LAMPORTS_PER_SOL).toFixed(4)} SOL`
         );
     }
 
@@ -247,6 +321,9 @@ async function uploadMetadata(sdk) {
 // =============================================================
 
 function pickTipAccount() {
+    if (!Array.isArray(JITO_TIP_ACCOUNTS) || JITO_TIP_ACCOUNTS.length === 0) {
+        throw new Error('Jito tip accounts list is empty — initTipAccounts() was not called or both live fetch and fallback failed');
+    }
     return new PublicKey(JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]);
 }
 
@@ -301,6 +378,13 @@ async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, wallet
         const group = bundleGroups[bi];
         const serializedTxs = [];
 
+        // Pick the tip account once per bundle so (a) we log the exact
+        // address (if Jito -32602 ever recurs we know which pubkey it
+        // rejected) and (b) create+buy bundles with multiple tip-eligible
+        // slots all write-lock the same account.
+        const tipAccount = pickTipAccount();
+        console.log(`   Bundle ${bi + 1}: tip ${(tipLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL -> ${tipAccount.toBase58()}`);
+
         // Labeled step tracker so if a bs58/anchor error fires deep in a
         // dependency, the thrown message still names the exact step + bundle.
         let step = 'init';
@@ -337,7 +421,7 @@ async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, wallet
                     createInstructions.push(
                         SystemProgram.transfer({
                             fromPubkey: mainKeypair.publicKey,
-                            toPubkey: pickTipAccount(),
+                            toPubkey: tipAccount,
                             lamports: tipLamports,
                         })
                     );
@@ -394,7 +478,7 @@ async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, wallet
                     buyInstructions.push(
                         SystemProgram.transfer({
                             fromPubkey: mainKeypair.publicKey,
-                            toPubkey: pickTipAccount(),
+                            toPubkey: tipAccount,
                             lamports: tipLamports,
                         })
                     );
@@ -449,7 +533,15 @@ async function submitJitoBundle(serializedTxs) {
                 lastErr = result.error;
                 continue; // next region
             }
-            throw new Error(`Jito error [${ep.name}]: ${JSON.stringify(result.error)}`);
+            // Non-rate-limit errors (-32602 bad tip account, -32000 signature
+            // errors, etc.) are deterministic for this exact signed payload —
+            // retrying the same bytes against another region fails the same
+            // way. Flag noRetry so `withRetry` bubbles immediately to the
+            // outer landingAttempt loop, which rebuilds with a fresh pick.
+            const err = new Error(`Jito error [${ep.name}]: ${JSON.stringify(result.error)}`);
+            err.noRetry = true;
+            err.jitoCode = result.error.code;
+            throw err;
         }
         return result.result; // bundle UUID
     }
@@ -762,6 +854,11 @@ async function main() {
     console.log(`   Main wallet: ${mainKeypair.publicKey.toBase58()}`);
 
     try {
+        // Pull Jito's live tip-account list *before* any code path can reach
+        // pickTipAccount(). Robust against Jito rotating addresses: the
+        // hardcoded list is just a fallback.
+        await initTipAccounts();
+
         // PHASE 1: Generate fresh wallets (new every launch)
         const walletData = generateFreshWallets(NUM_WALLETS);
 
