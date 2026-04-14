@@ -34,7 +34,31 @@ if (!RPC_ENDPOINT) {
     console.error(`Free RPC providers: Helius (helius.dev), QuickNode, Alchemy`);
     process.exit(1);
 }
-const JITO_BLOCK_ENGINE_URL = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
+// Jito block-engine regional endpoints. The default mainnet host is frequently
+// globally rate-limited (error -32097), so we round-robin across regions — each
+// region has its own rate-limit budget.
+const JITO_ENDPOINTS = [
+    { name: 'mainnet',   url: "https://mainnet.block-engine.jito.wtf/api/v1/bundles" },
+    { name: 'amsterdam', url: "https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/bundles" },
+    { name: 'frankfurt', url: "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles" },
+    { name: 'ny',        url: "https://ny.mainnet.block-engine.jito.wtf/api/v1/bundles" },
+    { name: 'slc',       url: "https://slc.mainnet.block-engine.jito.wtf/api/v1/bundles" },
+    { name: 'tokyo',     url: "https://tokyo.mainnet.block-engine.jito.wtf/api/v1/bundles" },
+];
+
+let _jitoEndpointIdx = 0;
+function nextJitoEndpoint() {
+    const ep = JITO_ENDPOINTS[_jitoEndpointIdx % JITO_ENDPOINTS.length];
+    _jitoEndpointIdx++;
+    return ep;
+}
+function isRateLimitError(errObj) {
+    // Jito uses -32097 for global rate-limit; check code + message defensively
+    if (!errObj) return false;
+    if (errObj.code === -32097) return true;
+    const msg = (errObj.message || '').toLowerCase();
+    return msg.includes('rate limit') || msg.includes('network congested');
+}
 
 // Jito tip accounts (official)
 const JITO_TIP_ACCOUNTS = [
@@ -373,26 +397,37 @@ async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, wallet
 async function submitJitoBundle(serializedTxs) {
     const encodedTxs = serializedTxs.map(tx => bs58.encode(tx));
 
-    const response = await fetch(JITO_BLOCK_ENGINE_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'sendBundle',
-            params: [encodedTxs],
-        }),
-    });
+    // Try each region; if we hit a rate-limit, skip to the next immediately.
+    let lastErr = null;
+    for (let i = 0; i < JITO_ENDPOINTS.length; i++) {
+        const ep = nextJitoEndpoint();
+        const response = await fetch(ep.url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'sendBundle',
+                params: [encodedTxs],
+            }),
+        });
 
-    const result = await response.json();
-    if (result.error) {
-        throw new Error(`Jito error: ${JSON.stringify(result.error)}`);
+        const result = await response.json();
+        if (result.error) {
+            if (isRateLimitError(result.error)) {
+                lastErr = result.error;
+                continue; // next region
+            }
+            throw new Error(`Jito error [${ep.name}]: ${JSON.stringify(result.error)}`);
+        }
+        return result.result; // bundle UUID
     }
-    return result.result; // bundle UUID
+    throw new Error(`Jito error: all regions rate-limited: ${JSON.stringify(lastErr)}`);
 }
 
 async function checkBundleStatus(bundleId) {
-    const response = await fetch(JITO_BLOCK_ENGINE_URL, {
+    const ep = nextJitoEndpoint();
+    const response = await fetch(ep.url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -405,14 +440,15 @@ async function checkBundleStatus(bundleId) {
     const result = await response.json();
     if (result.error) {
         // Return a sentinel so callers can distinguish API errors from "no status"
-        return { _jitoError: true, error: result.error };
+        return { _jitoError: true, error: result.error, endpoint: ep.name };
     }
     return result.result?.value?.[0] || null;
 }
 
 async function checkInflightBundleStatus(bundleId) {
     try {
-        const response = await fetch(JITO_BLOCK_ENGINE_URL, {
+        const ep = nextJitoEndpoint();
+        const response = await fetch(ep.url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -423,6 +459,7 @@ async function checkInflightBundleStatus(bundleId) {
             }),
         });
         const result = await response.json();
+        if (result.error) return null; // rate-limited or other — treat as inconclusive
         return result.result?.value?.[0] || null;
     } catch {
         return null;
@@ -432,10 +469,21 @@ async function checkInflightBundleStatus(bundleId) {
 async function submitAllBundles(allBundles) {
     console.log(`\n[PHASE 5] Submitting ${allBundles.length} bundle(s) to Jito...`);
     const bundleIds = [];
+    // Per-bundle tx signatures — used for RPC-side verification when Jito
+    // status API is rate-limited. Signatures are available on the signed
+    // VersionedTransaction before submission.
+    const bundleSigs = [];
 
     for (let i = 0; i < allBundles.length; i++) {
         const bundle = allBundles[i];
         console.log(`   Submitting bundle ${i + 1}/${allBundles.length} (${bundle.length} txs)...`);
+
+        // Extract signatures from each serialized tx in the bundle (for RPC verification)
+        const sigsForBundle = bundle.map(serialized => {
+            const tx = VersionedTransaction.deserialize(serialized);
+            return bs58.encode(tx.signatures[0]);
+        });
+        bundleSigs.push(sigsForBundle);
 
         const bundleId = await withRetry(
             () => submitJitoBundle(bundle),
@@ -450,22 +498,82 @@ async function submitAllBundles(allBundles) {
         }
     }
 
-    return bundleIds;
+    return { bundleIds, bundleSigs };
 }
 
-async function waitForBundles(bundleIds) {
+async function waitForBundles(bundleIds, { connection, mintPubkey, bundleSigs } = {}) {
     console.log(`\n[PHASE 6] Waiting for ${bundleIds.length} bundle(s) to confirm...`);
-    const maxAttempts = 30; // 60s max
+    // Extended polling (90s) because on-chain confirmation can lag bundle
+    // landing and — when Jito's API is rate-limited — the on-chain check is
+    // our only reliable signal.
+    const maxAttempts = 45;
     const confirmed = new Set();
     const failed = new Set();
     const lastStatus = {};
-    const noStatusCount = {}; // track consecutive genuine null responses (not errors)
-    const errorCount = {};    // track consecutive API errors separately
+    const noStatusCount = {}; // consecutive genuine null responses from Jito (not errors)
+    const errorCount = {};    // consecutive Jito API errors (rate-limits, etc.)
     bundleIds.forEach((_, i) => { noStatusCount[i] = 0; errorCount[i] = 0; });
+
+    const canCheckOnChain = !!(connection && mintPubkey);
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
         await new Promise(r => setTimeout(r, 2000));
 
+        // --- ON-CHAIN CHECK (authoritative signal) ---
+        // Run this first every tick. If the mint account exists, the create
+        // bundle landed regardless of what Jito says.
+        if (canCheckOnChain && !confirmed.has(0)) {
+            try {
+                const mintInfo = await connection.getAccountInfo(mintPubkey, 'confirmed');
+                if (mintInfo) {
+                    console.log(`   Bundle 1 (create): mint account EXISTS on-chain — confirmed via RPC`);
+                    confirmed.add(0);
+                }
+            } catch (e) {
+                // Non-fatal — RPC hiccup; fall through to Jito check
+            }
+        }
+
+        // --- RPC SIGNATURE STATUS CHECK for buy bundles ---
+        // For bundles we don't yet have a confirmation for, query the first
+        // tx signature directly. This bypasses Jito completely.
+        if (canCheckOnChain && bundleSigs) {
+            const toCheck = [];
+            for (let i = 0; i < bundleIds.length; i++) {
+                if (confirmed.has(i) || failed.has(i)) continue;
+                const sig = bundleSigs[i] && bundleSigs[i][0];
+                if (sig) toCheck.push({ idx: i, sig });
+            }
+            if (toCheck.length > 0) {
+                try {
+                    const sigStatuses = await connection.getSignatureStatuses(
+                        toCheck.map(t => t.sig),
+                        { searchTransactionHistory: false }
+                    );
+                    for (let k = 0; k < toCheck.length; k++) {
+                        const st = sigStatuses.value[k];
+                        const idx = toCheck[k].idx;
+                        if (!st) continue;
+                        if (st.err) {
+                            console.error(`   Bundle ${idx + 1}: RPC reports tx error: ${JSON.stringify(st.err)}`);
+                            failed.add(idx);
+                        } else if (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized') {
+                            console.log(`   Bundle ${idx + 1} ${st.confirmationStatus} via RPC! Slot: ${st.slot}`);
+                            confirmed.add(idx);
+                        }
+                    }
+                } catch (e) {
+                    // Non-fatal — RPC hiccup
+                }
+            }
+        }
+
+        if (confirmed.size === bundleIds.length) {
+            console.log(`   All ${bundleIds.length} bundle(s) confirmed.`);
+            return true;
+        }
+
+        // --- JITO STATUS CHECK (secondary signal) ---
         for (let i = 0; i < bundleIds.length; i++) {
             if (confirmed.has(i) || failed.has(i)) continue;
 
@@ -475,8 +583,9 @@ async function waitForBundles(bundleIds) {
                 // Jito API returned an error (rate limit, etc.) — don't count as "no status"
                 if (status && status._jitoError) {
                     errorCount[i]++;
-                    if (errorCount[i] % 5 === 1) {
-                        console.log(`   Bundle ${i + 1}: Jito API error (${errorCount[i]}x): ${status.error.message || JSON.stringify(status.error)}`);
+                    if (errorCount[i] === 1 || errorCount[i] % 10 === 0) {
+                        const rl = isRateLimitError(status.error) ? ' [rate-limited]' : '';
+                        console.log(`   Bundle ${i + 1}: Jito API error (${errorCount[i]}x)${rl} [endpoint: ${status.endpoint || '?'}]: ${status.error.message || JSON.stringify(status.error)}`);
                     }
                     continue;
                 }
@@ -512,11 +621,23 @@ async function waitForBundles(bundleIds) {
                         }
                     }
 
-                    // Only declare dropped after 15 genuine no-status responses (~30s)
-                    // and no inflight status
-                    if (noStatusCount[i] >= 15) {
-                        console.error(`   Bundle ${i + 1}: no status after ${noStatusCount[i]} checks — Jito dropped it`);
-                        failed.add(i);
+                    // Only declare dropped after 15 genuine no-status responses AND
+                    // no recent API errors AND no RPC signature found. When Jito
+                    // has been rate-limiting us, we don't trust "no status" as a
+                    // drop signal — wait for timeout and rely on on-chain check.
+                    if (noStatusCount[i] >= 15 && errorCount[i] === 0) {
+                        // Try one more RPC signature check before giving up
+                        let rpcSaysLanded = false;
+                        if (canCheckOnChain && bundleSigs && bundleSigs[i] && bundleSigs[i][0]) {
+                            try {
+                                const st = await connection.getSignatureStatuses([bundleSigs[i][0]], { searchTransactionHistory: true });
+                                if (st.value[0] && !st.value[0].err) rpcSaysLanded = true;
+                            } catch {}
+                        }
+                        if (!rpcSaysLanded) {
+                            console.error(`   Bundle ${i + 1}: no status after ${noStatusCount[i]} checks — Jito dropped it`);
+                            failed.add(i);
+                        }
                     }
                 }
             } catch (e) {
@@ -551,15 +672,26 @@ async function waitForBundles(bundleIds) {
         }
     }
 
-    // Timeout — show diagnostics
+    // Timeout — final on-chain check before giving up
     console.error(`\n   BUNDLE LANDING FAILED — timed out after ${maxAttempts * 2}s`);
+
+    if (canCheckOnChain && !confirmed.has(0)) {
+        try {
+            const mintInfo = await connection.getAccountInfo(mintPubkey, 'confirmed');
+            if (mintInfo) {
+                console.log(`   Final RPC check: mint account EXISTS — create bundle DID land`);
+                confirmed.add(0);
+            }
+        } catch {}
+    }
+
     for (let i = 0; i < bundleIds.length; i++) {
         if (!confirmed.has(i)) {
             const s = lastStatus[i];
             if (s) {
                 console.error(`   Bundle ${i + 1} (${bundleIds[i]}): last status = ${s.confirmation_status || 'unknown'}`);
             } else if (errorCount[i] > 0) {
-                console.error(`   Bundle ${i + 1} (${bundleIds[i]}): ${errorCount[i]} API errors — Jito may have been rate-limiting status checks`);
+                console.error(`   Bundle ${i + 1} (${bundleIds[i]}): ${errorCount[i]} API errors — Jito rate-limited status checks the entire time`);
             } else {
                 console.error(`   Bundle ${i + 1} (${bundleIds[i]}): no status returned — Jito dropped it`);
             }
@@ -764,21 +896,28 @@ async function main() {
         let lastBundleIds = [];
 
         for (let landingAttempt = 0; landingAttempt < MAX_LANDING_ATTEMPTS; landingAttempt++) {
-            if (landingAttempt > 0) {
-                // Before retrying, check if the mint already exists on-chain
-                // (previous bundle may have landed even though Jito didn't report it)
-                try {
-                    const mintInfo = await connection.getAccountInfo(mintKeypair.publicKey);
-                    if (mintInfo) {
+            // Unconditional mint-exists check at the top of every attempt.
+            // This prevents re-submitting a duplicate bundle whenever a prior
+            // attempt actually landed but Jito's rate-limited API failed to
+            // report it. Runs on attempt 0 too — harmless (no-op) but protects
+            // against races where the mint already exists for some reason.
+            try {
+                const mintInfo = await connection.getAccountInfo(mintKeypair.publicKey, 'confirmed');
+                if (mintInfo) {
+                    if (landingAttempt > 0) {
                         console.log(`   Mint account EXISTS on-chain — previous bundle DID land!`);
                         console.log(`   Jito status API failed to report it (likely rate-limited).`);
-                        success = true;
-                        break;
+                    } else {
+                        console.log(`   Mint account already exists on-chain — skipping launch.`);
                     }
-                } catch (e) {
-                    // Non-fatal — proceed with retry
+                    success = true;
+                    break;
                 }
+            } catch (e) {
+                // Non-fatal — proceed with attempt
+            }
 
+            if (landingAttempt > 0) {
                 currentTip = Math.floor(currentTip * TIP_MULTIPLIER);
                 console.log(`\n[RETRY ${landingAttempt}/${MAX_LANDING_ATTEMPTS - 1}] Rebuilding bundles with higher tip: ${(currentTip / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
             }
@@ -791,10 +930,18 @@ async function main() {
             );
 
             // PHASE 5: Submit bundles to Jito
-            lastBundleIds = await submitAllBundles(allBundles);
+            const submitResult = await submitAllBundles(allBundles);
+            lastBundleIds = submitResult.bundleIds;
+            const lastBundleSigs = submitResult.bundleSigs;
 
-            // PHASE 6: Wait for confirmation
-            success = await waitForBundles(lastBundleIds);
+            // PHASE 6: Wait for confirmation — pass RPC + mint + signatures so
+            // waitForBundles can fall back to on-chain verification whenever
+            // Jito's status API is rate-limited.
+            success = await waitForBundles(lastBundleIds, {
+                connection,
+                mintPubkey: mintKeypair.publicKey,
+                bundleSigs: lastBundleSigs,
+            });
 
             if (success) break;
 
