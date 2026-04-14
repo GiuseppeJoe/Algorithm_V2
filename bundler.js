@@ -233,6 +233,12 @@ async function uploadMetadata(sdk) {
         file: fileBlob,
     });
     console.log(`   Metadata URI: ${result.metadataUri}`);
+    // Validate response shape — pump.fun occasionally returns errors or
+    // shifted response formats; we'd rather fail loudly here than hand a
+    // malformed string downstream and get a cryptic bs58 error.
+    if (typeof result.metadataUri !== 'string' || !result.metadataUri.startsWith('http')) {
+        throw new Error(`Invalid metadataUri from pump.fun: ${JSON.stringify(result)}`);
+    }
     return result.metadataUri;
 }
 
@@ -288,103 +294,128 @@ async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, wallet
     // --- Build each bundle ---
     const allBundles = [];
 
+    // Matches Solana's base58 alphabet (excludes 0, O, I, l) with 32-44 char length
+    const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
     for (let bi = 0; bi < bundleGroups.length; bi++) {
         const group = bundleGroups[bi];
         const serializedTxs = [];
 
-        // Fresh blockhash per bundle — prevents stale-blockhash rejection
-        // on later bundles when build time exceeds ~60s
-        const { blockhash } = await connection.getLatestBlockhash('finalized');
+        // Labeled step tracker so if a bs58/anchor error fires deep in a
+        // dependency, the thrown message still names the exact step + bundle.
+        let step = 'init';
+        try {
+            step = 'getLatestBlockhash';
+            // Fresh blockhash per bundle — prevents stale-blockhash rejection
+            // on later bundles when build time exceeds ~60s
+            const { blockhash } = await connection.getLatestBlockhash('finalized');
 
-        // BUILD CREATE TX (only in first bundle)
-        if (group.includeCreate) {
-            const createTx = await sdk.getCreateInstructions(
-                mainKeypair.publicKey, coinData.name, coinData.symbol, metadataUri, mintKeypair
-            );
-
-            const createInstructions = [
-                ComputeBudgetProgram.setComputeUnitLimit({ units: 300000 }),
-                ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 }),
-                ...createTx.instructions,
-            ];
-
-            // If no buys in this bundle, add Jito tip here
-            if (group.walletIndices.length === 0) {
-                createInstructions.push(
-                    SystemProgram.transfer({
-                        fromPubkey: mainKeypair.publicKey,
-                        toPubkey: pickTipAccount(),
-                        lamports: tipLamports,
-                    })
-                );
+            // Validate — RPC occasionally returns odd payloads (error strings,
+            // empty objects). A bad blockhash triggers a cryptic "Non-base58
+            // character" later in compileToV0Message; fail with a clear
+            // message instead.
+            if (typeof blockhash !== 'string' || !BASE58_RE.test(blockhash)) {
+                throw new Error(`Invalid blockhash from RPC: ${JSON.stringify(blockhash)}`);
             }
 
-            const createMsg = new TransactionMessage({
-                payerKey: mainKeypair.publicKey,
-                recentBlockhash: blockhash,
-                instructions: createInstructions,
-            }).compileToV0Message();
-            const signedCreate = new VersionedTransaction(createMsg);
-            signedCreate.sign([mainKeypair, mintKeypair]);
-            serializedTxs.push(signedCreate.serialize());
-        }
-
-        // BUILD BUY TXS
-        for (let wi = 0; wi < group.walletIndices.length; wi++) {
-            const walletIdx = group.walletIndices[wi];
-            const buyer = walletKeypairs[walletIdx];
-            const isLastInBundle = (wi === group.walletIndices.length - 1);
-
-            const associatedUser = await getAssociatedTokenAddress(
-                mintKeypair.publicKey, buyer.publicKey, false
-            );
-
-            const buyInstructions = [
-                ComputeBudgetProgram.setComputeUnitLimit({ units: 200000 }),
-                ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 }),
-                // Create ATA (new wallet, no ATA exists yet)
-                createAssociatedTokenAccountInstruction(
-                    buyer.publicKey, associatedUser, buyer.publicKey, mintKeypair.publicKey
-                ),
-            ];
-
-            // Build buy instruction via Anchor (correct encoding guaranteed)
-            const buyIx = await sdk.program.methods
-                .buy(new BN(tokenAmount.toString()), new BN(maxSolCost.toString()))
-                .accounts({
-                    feeRecipient: feeRecipient,
-                    mint: mintKeypair.publicKey,
-                    associatedBondingCurve: associatedBondingCurve,
-                    associatedUser: associatedUser,
-                    user: buyer.publicKey,
-                })
-                .instruction();
-            buyInstructions.push(buyIx);
-
-            // Jito tip on the last tx of each bundle — paid by main wallet
-            // (buyer wallets are only funded for buy + ATA rent, not enough for tip)
-            if (isLastInBundle) {
-                buyInstructions.push(
-                    SystemProgram.transfer({
-                        fromPubkey: mainKeypair.publicKey,
-                        toPubkey: pickTipAccount(),
-                        lamports: tipLamports,
-                    })
+            // BUILD CREATE TX (only in first bundle)
+            if (group.includeCreate) {
+                step = 'sdk.getCreateInstructions';
+                const createTx = await sdk.getCreateInstructions(
+                    mainKeypair.publicKey, coinData.name, coinData.symbol, metadataUri, mintKeypair
                 );
+
+                step = 'compose create instructions';
+                const createInstructions = [
+                    ComputeBudgetProgram.setComputeUnitLimit({ units: 300000 }),
+                    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 }),
+                    ...createTx.instructions,
+                ];
+
+                // If no buys in this bundle, add Jito tip here
+                if (group.walletIndices.length === 0) {
+                    createInstructions.push(
+                        SystemProgram.transfer({
+                            fromPubkey: mainKeypair.publicKey,
+                            toPubkey: pickTipAccount(),
+                            lamports: tipLamports,
+                        })
+                    );
+                }
+
+                step = 'compile/sign create tx';
+                const createMsg = new TransactionMessage({
+                    payerKey: mainKeypair.publicKey,
+                    recentBlockhash: blockhash,
+                    instructions: createInstructions,
+                }).compileToV0Message();
+                const signedCreate = new VersionedTransaction(createMsg);
+                signedCreate.sign([mainKeypair, mintKeypair]);
+                serializedTxs.push(signedCreate.serialize());
             }
 
-            const buyMsg = new TransactionMessage({
-                payerKey: buyer.publicKey,
-                recentBlockhash: blockhash,
-                instructions: buyInstructions,
-            }).compileToV0Message();
-            const signedBuy = new VersionedTransaction(buyMsg);
-            // Main wallet must co-sign last tx (it pays the Jito tip)
-            signedBuy.sign(isLastInBundle ? [buyer, mainKeypair] : [buyer]);
-            serializedTxs.push(signedBuy.serialize());
-        }
+            // BUILD BUY TXS
+            for (let wi = 0; wi < group.walletIndices.length; wi++) {
+                const walletIdx = group.walletIndices[wi];
+                const buyer = walletKeypairs[walletIdx];
+                const isLastInBundle = (wi === group.walletIndices.length - 1);
 
-        allBundles.push(serializedTxs);
+                step = `getAssociatedTokenAddress (buy ${wi + 1})`;
+                const associatedUser = await getAssociatedTokenAddress(
+                    mintKeypair.publicKey, buyer.publicKey, false
+                );
+
+                const buyInstructions = [
+                    ComputeBudgetProgram.setComputeUnitLimit({ units: 200000 }),
+                    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 }),
+                    // Create ATA (new wallet, no ATA exists yet)
+                    createAssociatedTokenAccountInstruction(
+                        buyer.publicKey, associatedUser, buyer.publicKey, mintKeypair.publicKey
+                    ),
+                ];
+
+                step = `sdk.program.methods.buy (buy ${wi + 1})`;
+                // Build buy instruction via Anchor (correct encoding guaranteed)
+                const buyIx = await sdk.program.methods
+                    .buy(new BN(tokenAmount.toString()), new BN(maxSolCost.toString()))
+                    .accounts({
+                        feeRecipient: feeRecipient,
+                        mint: mintKeypair.publicKey,
+                        associatedBondingCurve: associatedBondingCurve,
+                        associatedUser: associatedUser,
+                        user: buyer.publicKey,
+                    })
+                    .instruction();
+                buyInstructions.push(buyIx);
+
+                // Jito tip on the last tx of each bundle — paid by main wallet
+                // (buyer wallets are only funded for buy + ATA rent, not enough for tip)
+                if (isLastInBundle) {
+                    buyInstructions.push(
+                        SystemProgram.transfer({
+                            fromPubkey: mainKeypair.publicKey,
+                            toPubkey: pickTipAccount(),
+                            lamports: tipLamports,
+                        })
+                    );
+                }
+
+                step = `compile/sign buy tx ${wi + 1}`;
+                const buyMsg = new TransactionMessage({
+                    payerKey: buyer.publicKey,
+                    recentBlockhash: blockhash,
+                    instructions: buyInstructions,
+                }).compileToV0Message();
+                const signedBuy = new VersionedTransaction(buyMsg);
+                // Main wallet must co-sign last tx (it pays the Jito tip)
+                signedBuy.sign(isLastInBundle ? [buyer, mainKeypair] : [buyer]);
+                serializedTxs.push(signedBuy.serialize());
+            }
+
+            allBundles.push(serializedTxs);
+        } catch (e) {
+            throw new Error(`buildAllBundles bundle ${bi + 1}, step "${step}": ${e.message || e}`);
+        }
     }
 
     return allBundles;
@@ -983,6 +1014,7 @@ async function main() {
 
     } catch (e) {
         console.error(`\nFATAL ERROR:`, e.message || e);
+        if (e.stack) console.error(e.stack);
         if (e.logs) console.log("TX LOGS:", e.logs.join('\n'));
         process.exit(1);
     }
