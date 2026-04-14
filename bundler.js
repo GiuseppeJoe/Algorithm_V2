@@ -130,7 +130,10 @@ async function initTipAccounts() {
 // Tunable parameters (override via .env)
 const NUM_WALLETS = parseInt(process.env.BUNDLE_WALLET_COUNT || "20");
 const BUY_SOL_PER_WALLET = parseFloat(process.env.BUNDLE_BUY_SOL || "0.001");
-const JITO_TIP_LAMPORTS = parseInt(process.env.JITO_TIP_LAMPORTS || "1000000"); // 0.001 SOL
+// 0.002 SOL baseline — pump.fun launches during congestion routinely need
+// 0.005+ to win the Jito auction, so our 2× escalation (0.002 → 0.004 →
+// 0.008) gives us headroom by attempt 3. Overridable via .env.
+const JITO_TIP_LAMPORTS = parseInt(process.env.JITO_TIP_LAMPORTS || "2000000"); // 0.002 SOL
 const SLIPPAGE_BPS = 2500n; // 25% slippage for bundled buys
 const MAX_TXS_PER_BUNDLE = 5;
 const DRY_RUN = process.argv.includes("--dry-run");
@@ -633,9 +636,14 @@ async function waitForBundles(bundleIds, { connection, mintPubkey, bundleSigs } 
     const confirmed = new Set();
     const failed = new Set();
     const lastStatus = {};
-    const noStatusCount = {}; // consecutive genuine null responses from Jito (not errors)
-    const errorCount = {};    // consecutive Jito API errors (rate-limits, etc.)
-    bundleIds.forEach((_, i) => { noStatusCount[i] = 0; errorCount[i] = 0; });
+    const noStatusCount = {};           // consecutive genuine null responses from Jito (not errors)
+    const errorCount = {};              // consecutive Jito API errors (rate-limits, etc.)
+    const inflightTerminalCount = {};   // consecutive terminal (Invalid/Failed) inflight replies
+    bundleIds.forEach((_, i) => {
+        noStatusCount[i] = 0;
+        errorCount[i] = 0;
+        inflightTerminalCount[i] = 0;
+    });
 
     const canCheckOnChain = !!(connection && mintPubkey);
 
@@ -734,12 +742,45 @@ async function waitForBundles(bundleIds, { connection, mintPubkey, bundleSigs } 
                 } else {
                     noStatusCount[i]++;
 
-                    // Before declaring dropped, check if it's still in Jito's queue
+                    // Before declaring dropped, check Jito's inflight tracker.
+                    // Valid statuses per Jito docs:
+                    //   Landed  — bundle landed on-chain (success)
+                    //   Pending — still being processed (keep waiting)
+                    //   Failed  — all regions rejected (terminal)
+                    //   Invalid — bundle ID not found in 5-min window (terminal;
+                    //             can be briefly transient during regional
+                    //             consistency right after submit, so require
+                    //             two consecutive reads before declaring dead)
                     if (noStatusCount[i] >= 8) {
                         const inflight = await checkInflightBundleStatus(bundleIds[i]);
                         if (inflight) {
-                            console.log(`   Bundle ${i + 1}: still in Jito queue (status: ${inflight.status || 'pending'}) — continuing to wait`);
-                            noStatusCount[i] = 0; // reset — it's still alive
+                            const s = String(inflight.status || '').toLowerCase();
+                            if (s === 'landed') {
+                                console.log(`   Bundle ${i + 1}: Jito reports LANDED`);
+                                confirmed.add(i);
+                                inflightTerminalCount[i] = 0;
+                                continue;
+                            }
+                            if (s === 'pending') {
+                                console.log(`   Bundle ${i + 1}: still in Jito queue (status: Pending) — continuing to wait`);
+                                noStatusCount[i] = 0;
+                                inflightTerminalCount[i] = 0;
+                                continue;
+                            }
+                            if (s === 'failed' || s === 'invalid') {
+                                inflightTerminalCount[i]++;
+                                if (inflightTerminalCount[i] >= 2) {
+                                    console.error(`   Bundle ${i + 1}: Jito reports ${s.toUpperCase()} (${inflightTerminalCount[i]}x) — dropped (lost auction / tip too low)`);
+                                    failed.add(i);
+                                    continue;
+                                }
+                                console.log(`   Bundle ${i + 1}: Jito reports ${s.toUpperCase()} (1x) — waiting one more tick to confirm`);
+                                continue;
+                            }
+                            // Unknown status value — treat conservatively as alive
+                            console.log(`   Bundle ${i + 1}: Jito reports unknown status '${inflight.status}' — continuing to wait`);
+                            noStatusCount[i] = 0;
+                            inflightTerminalCount[i] = 0;
                             continue;
                         }
                     }
