@@ -127,6 +127,32 @@ async function initTipAccounts() {
     }
 }
 
+// Query Jito's public tip-floor endpoint for the live 75th/95th percentile of
+// *landed* tips. This is the only way to know what tip is actually winning
+// the auction right now — a static default will silently under-tip during
+// congestion and our bundle gets dropped (the core reliability issue).
+// Returns SOL values (not lamports); caller converts. Null on any failure.
+async function fetchJitoTipFloor() {
+    try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 5000);
+        const res = await fetch('https://bundles.jito.wtf/api/v1/bundles/tip_floor', { signal: ctrl.signal });
+        clearTimeout(t);
+        const json = await res.json();
+        const row = Array.isArray(json) ? json[0] : (json && json.data && json.data[0]);
+        if (!row) return null;
+        const p75 = Number(row.landed_tips_75th_percentile);
+        const p95 = Number(row.landed_tips_95th_percentile);
+        if (!Number.isFinite(p75) || p75 <= 0) return null;
+        return {
+            p75,
+            p95: Number.isFinite(p95) && p95 > 0 ? p95 : null,
+        };
+    } catch (_) {
+        return null;
+    }
+}
+
 // Tunable parameters (override via .env)
 const NUM_WALLETS = parseInt(process.env.BUNDLE_WALLET_COUNT || "20");
 const BUY_SOL_PER_WALLET = parseFloat(process.env.BUNDLE_BUY_SOL || "0.001");
@@ -222,7 +248,7 @@ async function withRetry(fn, { retries = 3, baseDelay = 1000, label = '' } = {})
 // PHASE 2: FUND WALLETS (fire-all-then-confirm)
 // =============================================================
 
-async function fundWallets(connection, mainKeypair, walletDataList, solPerWallet) {
+async function fundWallets(connection, mainKeypair, walletDataList, solPerWallet, startingTipLamports) {
     console.log(`\n[PHASE 2] Funding ${walletDataList.length} wallets (${solPerWallet} SOL buy + fees each)...`);
 
     // Each wallet needs: buy SOL + ~0.003 SOL for ATA rent + tx fee
@@ -235,15 +261,18 @@ async function fundWallets(connection, mainKeypair, walletDataList, solPerWallet
 
     // Worst-case tip spend: main wallet pays one tip per bundle, and the
     // landingAttempt loop (main orchestrator) can escalate 2× across 3
-    // attempts — so the peak is numBundles × (1 + 2 + 4) × JITO_TIP_LAMPORTS.
-    // Without this check a late-stage retry with escalated tip could fail
-    // mid-flight when the main wallet runs out of SOL.
+    // attempts — so the peak is numBundles × (1 + 2 + 4) × startingTip.
+    // Uses the *dynamic* starting tip (live Jito p75) when provided, so the
+    // balance check reflects reality during congestion. Without this a
+    // late-stage retry with escalated tip could fail mid-flight when the
+    // main wallet runs out of SOL.
+    const tipPerBundle = startingTipLamports || JITO_TIP_LAMPORTS;
     const firstGroupSize = MAX_TXS_PER_BUNDLE - 1;
     const remaining = Math.max(0, walletDataList.length - firstGroupSize);
     const numBundles = 1 + Math.ceil(remaining / MAX_TXS_PER_BUNDLE);
-    const worstCaseTip = JITO_TIP_LAMPORTS * numBundles * (1 + 2 + 4);
+    const worstCaseTip = tipPerBundle * numBundles * (1 + 2 + 4);
     const buffer = 0.01 * LAMPORTS_PER_SOL + worstCaseTip;
-    console.log(`   Worst-case tip:      ${(worstCaseTip / LAMPORTS_PER_SOL).toFixed(4)} SOL (${numBundles} bundles × 7× escalation)`);
+    console.log(`   Worst-case tip:      ${(worstCaseTip / LAMPORTS_PER_SOL).toFixed(4)} SOL (${numBundles} bundle(s) × 7× escalation at ${(tipPerBundle / LAMPORTS_PER_SOL).toFixed(4)} SOL baseline)`);
 
     if (balance < totalNeeded + buffer) {
         throw new Error(
@@ -900,6 +929,24 @@ async function main() {
         // hardcoded list is just a fallback.
         await initTipAccounts();
 
+        // Pull live Jito tip-floor percentiles. The 75th percentile of
+        // recently-landed tips is the single best proxy for "what tip is
+        // winning the auction right now." Use max(env-baseline, live p75)
+        // so a user-configured floor can override upward but we never
+        // silently under-tip the live market and get our bundle dropped.
+        const tipFloor = await fetchJitoTipFloor();
+        let startingTip = JITO_TIP_LAMPORTS;
+        if (tipFloor) {
+            const p75Lamports = Math.ceil(tipFloor.p75 * LAMPORTS_PER_SOL);
+            const p95Lamports = tipFloor.p95 ? Math.ceil(tipFloor.p95 * LAMPORTS_PER_SOL) : null;
+            startingTip = Math.max(JITO_TIP_LAMPORTS, p75Lamports);
+            console.log(`   Jito tip floor: p75 ${(p75Lamports / LAMPORTS_PER_SOL).toFixed(4)} SOL` +
+                (p95Lamports ? ` | p95 ${(p95Lamports / LAMPORTS_PER_SOL).toFixed(4)} SOL` : ''));
+            console.log(`   Starting tip:   ${(startingTip / LAMPORTS_PER_SOL).toFixed(4)} SOL (env baseline: ${(JITO_TIP_LAMPORTS / LAMPORTS_PER_SOL).toFixed(4)} SOL)`);
+        } else {
+            console.log(`   Jito tip floor: unavailable — using static baseline ${(startingTip / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+        }
+
         // PHASE 1: Generate fresh wallets (new every launch)
         const walletData = generateFreshWallets(NUM_WALLETS);
 
@@ -1047,7 +1094,7 @@ async function main() {
         }
 
         // PHASE 2: Fund wallets
-        await fundWallets(connection, mainKeypair, walletData, BUY_SOL_PER_WALLET);
+        await fundWallets(connection, mainKeypair, walletData, BUY_SOL_PER_WALLET, startingTip);
 
         // PHASE 3: Upload metadata to IPFS
         const metadataUri = await uploadMetadata(sdk);
@@ -1060,7 +1107,7 @@ async function main() {
         console.log(`MINT_ADDRESS: ${mintKeypair.publicKey.toBase58()}`);
         const walletKeypairs = walletData.map(toKeypair);
 
-        let currentTip = JITO_TIP_LAMPORTS;
+        let currentTip = startingTip;
         let success = false;
         let lastBundleIds = [];
 
