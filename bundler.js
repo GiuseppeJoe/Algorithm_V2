@@ -544,40 +544,55 @@ async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, wallet
 async function submitJitoBundle(serializedTxs) {
     const encodedTxs = serializedTxs.map(tx => bs58.encode(tx));
 
-    // Try each region; if we hit a rate-limit, skip to the next immediately.
-    let lastErr = null;
-    for (let i = 0; i < JITO_ENDPOINTS.length; i++) {
-        const ep = nextJitoEndpoint();
-        const response = await fetch(ep.url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                jsonrpc: '2.0',
-                id: 1,
-                method: 'sendBundle',
-                params: [encodedTxs],
-            }),
-        });
+    // Submit to ALL regions simultaneously. Sequential submission means only
+    // one region's validators see the bundle — if they don't have a leader
+    // slot in the bundle's validity window, it never lands. Broadcasting to
+    // all 6 regions maximises validator coverage.
+    const submissions = await Promise.allSettled(
+        JITO_ENDPOINTS.map(ep =>
+            fetch(ep.url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    method: 'sendBundle',
+                    params: [encodedTxs],
+                }),
+            })
+            .then(r => r.json())
+            .then(result => {
+                if (result.error) {
+                    if (isRateLimitError(result.error)) {
+                        return { ep, rateLimited: true, error: result.error };
+                    }
+                    // Deterministic rejection (-32602 bad tip, etc.) — same
+                    // bytes will fail on every region. Surface immediately.
+                    const err = new Error(`Jito error [${ep.name}]: ${JSON.stringify(result.error)}`);
+                    err.noRetry = true;
+                    err.jitoCode = result.error.code;
+                    throw err;
+                }
+                return { ep, uuid: result.result };
+            })
+            .catch(err => { err._ep = ep.name; throw err; })
+        )
+    );
 
-        const result = await response.json();
-        if (result.error) {
-            if (isRateLimitError(result.error)) {
-                lastErr = result.error;
-                continue; // next region
-            }
-            // Non-rate-limit errors (-32602 bad tip account, -32000 signature
-            // errors, etc.) are deterministic for this exact signed payload —
-            // retrying the same bytes against another region fails the same
-            // way. Flag noRetry so `withRetry` bubbles immediately to the
-            // outer landingAttempt loop, which rebuilds with a fresh pick.
-            const err = new Error(`Jito error [${ep.name}]: ${JSON.stringify(result.error)}`);
-            err.noRetry = true;
-            err.jitoCode = result.error.code;
-            throw err;
-        }
-        return result.result; // bundle UUID
+    const successes = submissions.filter(r => r.status === 'fulfilled' && r.value && r.value.uuid);
+    const hardFail  = submissions.find(r => r.status === 'rejected' && r.reason && r.reason.noRetry);
+
+    if (hardFail) throw hardFail.reason;
+
+    if (successes.length === 0) {
+        const rateLimitedCount = submissions.filter(r => r.status === 'fulfilled' && r.value && r.value.rateLimited).length;
+        const errorCount = submissions.filter(r => r.status === 'rejected').length;
+        throw new Error(`Jito error: all ${JITO_ENDPOINTS.length} regions failed (${rateLimitedCount} rate-limited, ${errorCount} errors)`);
     }
-    throw new Error(`Jito error: all regions rate-limited: ${JSON.stringify(lastErr)}`);
+
+    const regions = successes.map(r => r.value.ep.name).join(', ');
+    console.log(`   Accepted by ${successes.length}/${JITO_ENDPOINTS.length} regions: [${regions}]`);
+    return successes[0].value.uuid; // primary UUID for status tracking
 }
 
 async function checkBundleStatus(bundleId) {
@@ -689,10 +704,10 @@ async function submitAllBundles(allBundles, connection) {
 
 async function waitForBundles(bundleIds, { connection, mintPubkey, bundleSigs } = {}) {
     console.log(`\n[PHASE 6] Waiting for ${bundleIds.length} bundle(s) to confirm...`);
-    // Extended polling (90s) because on-chain confirmation can lag bundle
-    // landing and — when Jito's API is rate-limited — the on-chain check is
-    // our only reliable signal.
-    const maxAttempts = 45;
+    // 40s window per attempt. A Solana blockhash is valid ~60s; if nothing
+    // lands in 40s the bundle is effectively dead — fail fast and let the
+    // landingAttempt loop rebuild with a fresh blockhash + higher tip.
+    const maxAttempts = 20;
     const confirmed = new Set();
     const failed = new Set();
     const lastStatus = {};
@@ -811,7 +826,7 @@ async function waitForBundles(bundleIds, { connection, mintPubkey, bundleSigs } 
                     //             can be briefly transient during regional
                     //             consistency right after submit, so require
                     //             two consecutive reads before declaring dead)
-                    if (noStatusCount[i] >= 8) {
+                    if (noStatusCount[i] >= 5) {
                         const inflight = await checkInflightBundleStatus(bundleIds[i]);
                         if (inflight) {
                             const s = String(inflight.status || '').toLowerCase();
@@ -849,7 +864,7 @@ async function waitForBundles(bundleIds, { connection, mintPubkey, bundleSigs } 
                     // no recent API errors AND no RPC signature found. When Jito
                     // has been rate-limiting us, we don't trust "no status" as a
                     // drop signal — wait for timeout and rely on on-chain check.
-                    if (noStatusCount[i] >= 15 && errorCount[i] === 0) {
+                    if (noStatusCount[i] >= 10 && errorCount[i] === 0) {
                         // Try one more RPC signature check before giving up
                         let rpcSaysLanded = false;
                         if (canCheckOnChain && bundleSigs && bundleSigs[i] && bundleSigs[i][0]) {
