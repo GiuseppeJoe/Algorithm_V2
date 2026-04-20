@@ -621,8 +621,39 @@ async function checkInflightBundleStatus(bundleId) {
     }
 }
 
-async function submitAllBundles(allBundles) {
+async function submitAllBundles(allBundles, connection) {
     console.log(`\n[PHASE 5] Submitting ${allBundles.length} bundle(s) to Jito...`);
+
+    // --- PRE-SUBMISSION SIMULATION ---
+    // Simulate the create tx on our RPC before committing to the Jito auction.
+    // Jito's block engine silently drops bundles that fail internal simulation
+    // with zero feedback — the bundle UUID is returned, then it never lands.
+    // By simulating first, we surface program errors instantly instead of
+    // waiting 90s for a timeout. Buy txs can't be simulated individually
+    // (they depend on the create having executed), but if the create is
+    // invalid, nothing will land anyway.
+    console.log(`   Simulating create transaction on RPC...`);
+    try {
+        const createTx = VersionedTransaction.deserialize(allBundles[0][0]);
+        const simResult = await connection.simulateTransaction(createTx, {
+            sigVerify: false,
+            replaceRecentBlockhash: true,
+        });
+        if (simResult.value.err) {
+            console.error(`   CREATE TX SIMULATION FAILED:`);
+            console.error(`     Error: ${JSON.stringify(simResult.value.err)}`);
+            if (simResult.value.logs) {
+                console.error(`     Program logs:`);
+                simResult.value.logs.forEach(l => console.error(`       ${l}`));
+            }
+            throw new Error(`Create tx would fail on-chain: ${JSON.stringify(simResult.value.err)}. Aborting before wasting Jito tip.`);
+        }
+        console.log(`   Create TX simulation: PASSED (${simResult.value.unitsConsumed || '?'} compute units)`);
+    } catch (e) {
+        if (e.message.startsWith('Create tx would fail')) throw e;
+        console.log(`   Create TX simulation: inconclusive (${e.message}) — proceeding with submission`);
+    }
+
     const bundleIds = [];
     // Per-bundle tx signatures — used for RPC-side verification when Jito
     // status API is rate-limited. Signatures are available on the signed
@@ -1146,7 +1177,7 @@ async function main() {
             );
 
             // PHASE 5: Submit bundles to Jito
-            const submitResult = await submitAllBundles(allBundles);
+            const submitResult = await submitAllBundles(allBundles, connection);
             lastBundleIds = submitResult.bundleIds;
             const lastBundleSigs = submitResult.bundleSigs;
 
