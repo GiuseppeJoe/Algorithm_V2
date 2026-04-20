@@ -449,7 +449,7 @@ async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, wallet
                 ];
 
                 // If no buys in this bundle, add Jito tip here
-                if (group.walletIndices.length === 0) {
+                if (group.walletIndices.length === 0 && tipLamports > 0) {
                     createInstructions.push(
                         SystemProgram.transfer({
                             fromPubkey: mainKeypair.publicKey,
@@ -505,8 +505,10 @@ async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, wallet
                 buyInstructions.push(buyIx);
 
                 // Jito tip on the last tx of each bundle — paid by main wallet
-                // (buyer wallets are only funded for buy + ATA rent, not enough for tip)
-                if (isLastInBundle) {
+                // (buyer wallets are only funded for buy + ATA rent, not enough for tip).
+                // Skipped when tipLamports === 0 (non-bundled fallback path).
+                const needsTip = isLastInBundle && tipLamports > 0;
+                if (needsTip) {
                     buyInstructions.push(
                         SystemProgram.transfer({
                             fromPubkey: mainKeypair.publicKey,
@@ -523,8 +525,7 @@ async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, wallet
                     instructions: buyInstructions,
                 }).compileToV0Message();
                 const signedBuy = new VersionedTransaction(buyMsg);
-                // Main wallet must co-sign last tx (it pays the Jito tip)
-                signedBuy.sign(isLastInBundle ? [buyer, mainKeypair] : [buyer]);
+                signedBuy.sign(needsTip ? [buyer, mainKeypair] : [buyer]);
                 serializedTxs.push(signedBuy.serialize());
             }
 
@@ -1222,6 +1223,123 @@ async function main() {
                 }
             } catch (e) {
                 // Non-fatal
+            }
+        }
+
+        // =============================================================
+        // FALLBACK: Non-bundled sequential submission via RPC
+        //
+        // If ALL Jito bundle attempts failed, bypass Jito entirely and
+        // submit transactions individually through our RPC. This trades
+        // full atomicity for actual landing — the create tx is sent
+        // first, confirmed, then buy txs are blasted in parallel.
+        //
+        // The sniping window between create and buys is 1-2 slots
+        // (~0.8-1.6s) at most, acceptable for low-value launches.
+        // =============================================================
+        if (!success) {
+            console.log(`\n========================================`);
+            console.log(`  [FALLBACK] Jito bundles failed ${MAX_LANDING_ATTEMPTS}× — switching to direct RPC submission`);
+            console.log(`========================================`);
+
+            try {
+                // Build fresh transactions WITHOUT Jito tip (tipLamports = 0)
+                console.log(`\n[FALLBACK PHASE 1] Building transactions (no Jito tip)...`);
+                const fallbackBundles = await buildAllBundles(
+                    connection, sdk, mainKeypair, mintKeypair,
+                    walletKeypairs, metadataUri, BUY_SOL_PER_WALLET,
+                    0 // no tip — we're not going through Jito
+                );
+
+                // Submit create tx via regular RPC
+                console.log(`\n[FALLBACK PHASE 2] Submitting create transaction via RPC...`);
+                const createTxBytes = fallbackBundles[0][0];
+                const createSig = await withRetry(async () => {
+                    const tx = VersionedTransaction.deserialize(createTxBytes);
+                    return await connection.sendTransaction(tx, {
+                        skipPreflight: false,
+                        maxRetries: 3,
+                    });
+                }, { label: 'create tx via RPC', retries: 2, baseDelay: 1000 });
+                console.log(`   Create TX sent: ${createSig}`);
+
+                // Wait for create to confirm
+                console.log(`   Waiting for create TX confirmation...`);
+                await connection.confirmTransaction(createSig, 'confirmed');
+                console.log(`   Create TX confirmed!`);
+
+                // Verify mint exists on-chain
+                const mintCheck = await connection.getAccountInfo(mintKeypair.publicKey, 'confirmed');
+                if (!mintCheck) {
+                    throw new Error('Create TX confirmed but mint account not found on-chain');
+                }
+                console.log(`   Mint account verified on-chain: ${mintKeypair.publicKey.toBase58()}`);
+
+                // Submit all buy txs in parallel via RPC
+                console.log(`\n[FALLBACK PHASE 3] Submitting ${walletKeypairs.length} buy transactions via RPC...`);
+
+                // Collect all buy tx bytes (skip first tx in first bundle — that's the create)
+                const buyTxBytes = [];
+                for (let bi = 0; bi < fallbackBundles.length; bi++) {
+                    const startIdx = (bi === 0) ? 1 : 0;
+                    for (let ti = startIdx; ti < fallbackBundles[bi].length; ti++) {
+                        buyTxBytes.push(fallbackBundles[bi][ti]);
+                    }
+                }
+
+                // Need fresh blockhash for buy txs since they were built minutes ago
+                // Rebuild each buy tx with fresh blockhash
+                const { blockhash: freshBlockhash } = await connection.getLatestBlockhash('confirmed');
+                const buyResults = await Promise.allSettled(
+                    buyTxBytes.map(async (txBytes, idx) => {
+                        const tx = VersionedTransaction.deserialize(txBytes);
+                        // Replace blockhash with fresh one
+                        tx.message.recentBlockhash = freshBlockhash;
+                        // Re-sign (blockhash changed so signatures are invalid)
+                        const buyer = walletKeypairs[idx];
+                        tx.sign([buyer]);
+                        const sig = await connection.sendTransaction(tx, {
+                            skipPreflight: false,
+                            maxRetries: 3,
+                        });
+                        console.log(`   Buy ${idx + 1}/${buyTxBytes.length} sent: ${sig}`);
+                        return sig;
+                    })
+                );
+
+                const buySuccesses = buyResults.filter(r => r.status === 'fulfilled');
+                const buyFailures = buyResults.filter(r => r.status === 'rejected');
+                console.log(`   Buy results: ${buySuccesses.length}/${buyTxBytes.length} sent`);
+                if (buyFailures.length > 0) {
+                    buyFailures.forEach((f, i) => console.error(`   Buy failure: ${f.reason?.message || f.reason}`));
+                }
+
+                // Wait for buy confirmations
+                if (buySuccesses.length > 0) {
+                    console.log(`   Confirming ${buySuccesses.length} buy transaction(s)...`);
+                    const confirmResults = await Promise.allSettled(
+                        buySuccesses.map(r =>
+                            connection.confirmTransaction(r.value, 'confirmed')
+                        )
+                    );
+                    const confirmed = confirmResults.filter(r => r.status === 'fulfilled').length;
+                    console.log(`   ${confirmed}/${buySuccesses.length} buy txs confirmed`);
+                }
+
+                success = true;
+                lastBundleIds = ['FALLBACK-RPC'];
+            } catch (fallbackErr) {
+                console.error(`\n[FALLBACK] Failed: ${fallbackErr.message}`);
+                if (fallbackErr.stack) console.error(fallbackErr.stack);
+                // Check if create at least landed
+                try {
+                    const mintInfo = await connection.getAccountInfo(mintKeypair.publicKey, 'confirmed');
+                    if (mintInfo) {
+                        console.log(`   Mint DID land despite buy failures — token exists on pump.fun`);
+                        success = true;
+                        lastBundleIds = ['FALLBACK-PARTIAL'];
+                    }
+                } catch (_) {}
             }
         }
 
