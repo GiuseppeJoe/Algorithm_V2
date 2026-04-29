@@ -14,7 +14,7 @@ const fs = require('fs');
 require('dotenv').config();
 const {
     Connection, Keypair, PublicKey, SystemProgram,
-    TransactionMessage, VersionedTransaction,
+    TransactionMessage, VersionedTransaction, TransactionInstruction,
     LAMPORTS_PER_SOL, ComputeBudgetProgram
 } = require('@solana/web3.js');
 const { Wallet, AnchorProvider } = require('@coral-xyz/anchor');
@@ -22,7 +22,7 @@ const { PumpFunSDK, calculateWithSlippageBuy } = require('pumpdotfun-sdk');
 const { getAssociatedTokenAddress, createAssociatedTokenAccountInstruction } = require('@solana/spl-token');
 const _bs58 = require('bs58');
 const bs58 = _bs58.default || _bs58;
-const BN = require('bn.js');
+// BN no longer needed — buy instruction is now built manually via TransactionInstruction
 
 // --- CONFIGURATION ---
 const RPC_ENDPOINT = process.env.RPC_ENDPOINT;
@@ -82,6 +82,28 @@ let JITO_TIP_ACCOUNTS = JITO_TIP_ACCOUNTS_FALLBACK;
 // accounts, RPC responses). A bad address here causes Jito -32602 or the
 // cryptic "Non-base58 character" error from @solana/web3.js.
 const BASE58_PUBKEY_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+// --- PUMP.FUN PROGRAM CONSTANTS (updated IDL, August 2025) ---
+// The buy instruction was updated with new accounts (creator_vault, fee_config,
+// fee_program, global_volume_accumulator, user_volume_accumulator) and a new
+// track_volume argument. The old pumpdotfun-sdk v1.3.2 doesn't include these,
+// so we build buy instructions manually.
+const PUMP_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+const FEE_PROGRAM  = new PublicKey("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
+const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+
+const BUY_DISCRIMINATOR = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
+const INIT_UVA_DISCRIMINATOR = Buffer.from([94, 6, 202, 115, 255, 96, 232, 183]);
+const FEE_CONFIG_SEED2 = Buffer.from([
+    1, 86, 224, 246, 147, 102, 90, 207, 68, 219, 21, 104,
+    191, 23, 91, 170, 81, 137, 203, 151, 245, 210, 255, 59,
+    101, 93, 43, 182, 253, 109, 24, 176
+]);
+
+const [GLOBAL_PDA]      = PublicKey.findProgramAddressSync([Buffer.from("global")], PUMP_PROGRAM);
+const [EVENT_AUTHORITY]  = PublicKey.findProgramAddressSync([Buffer.from("__event_authority")], PUMP_PROGRAM);
+const [GLOBAL_VOL_ACC]   = PublicKey.findProgramAddressSync([Buffer.from("global_volume_accumulator")], PUMP_PROGRAM);
+const [FEE_CONFIG_PDA]   = PublicKey.findProgramAddressSync([Buffer.from("fee_config"), FEE_CONFIG_SEED2], FEE_PROGRAM);
 
 // Query Jito for the live tip-account list. Rotates through regions to
 // shrug off per-region rate limits; times out each request at 5s. Returns
@@ -245,14 +267,77 @@ async function withRetry(fn, { retries = 3, baseDelay = 1000, label = '' } = {})
 }
 
 // =============================================================
+// PUMP.FUN BUY INSTRUCTION BUILDER (new IDL, August 2025+)
+// =============================================================
+
+function buildBuyInstruction({ buyer, mint, feeRecipient, associatedBondingCurve, associatedUser, creatorPubkey, tokenAmount, maxSolCost }) {
+    const bondingCurve = PublicKey.findProgramAddressSync(
+        [Buffer.from("bonding-curve"), mint.toBuffer()], PUMP_PROGRAM
+    )[0];
+    const creatorVault = PublicKey.findProgramAddressSync(
+        [Buffer.from("creator-vault"), creatorPubkey.toBuffer()], PUMP_PROGRAM
+    )[0];
+    const userVolAcc = PublicKey.findProgramAddressSync(
+        [Buffer.from("user_volume_accumulator"), buyer.toBuffer()], PUMP_PROGRAM
+    )[0];
+
+    const data = Buffer.alloc(25);
+    BUY_DISCRIMINATOR.copy(data, 0);
+    data.writeBigUInt64LE(BigInt(tokenAmount.toString()), 8);
+    data.writeBigUInt64LE(BigInt(maxSolCost.toString()), 16);
+    data[24] = 0; // OptionBool(false) — skip volume tracking
+
+    return new TransactionInstruction({
+        programId: PUMP_PROGRAM,
+        keys: [
+            { pubkey: GLOBAL_PDA, isSigner: false, isWritable: false },
+            { pubkey: feeRecipient, isSigner: false, isWritable: true },
+            { pubkey: mint, isSigner: false, isWritable: false },
+            { pubkey: bondingCurve, isSigner: false, isWritable: true },
+            { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
+            { pubkey: associatedUser, isSigner: false, isWritable: true },
+            { pubkey: buyer, isSigner: true, isWritable: true },
+            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+            { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+            { pubkey: creatorVault, isSigner: false, isWritable: true },
+            { pubkey: EVENT_AUTHORITY, isSigner: false, isWritable: false },
+            { pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },
+            { pubkey: GLOBAL_VOL_ACC, isSigner: false, isWritable: false },
+            { pubkey: userVolAcc, isSigner: false, isWritable: true },
+            { pubkey: FEE_CONFIG_PDA, isSigner: false, isWritable: false },
+            { pubkey: FEE_PROGRAM, isSigner: false, isWritable: false },
+        ],
+        data,
+    });
+}
+
+function buildInitUserVolumeAccumulator(payer, user) {
+    const userVolAcc = PublicKey.findProgramAddressSync(
+        [Buffer.from("user_volume_accumulator"), user.toBuffer()], PUMP_PROGRAM
+    )[0];
+    return new TransactionInstruction({
+        programId: PUMP_PROGRAM,
+        keys: [
+            { pubkey: payer, isSigner: true, isWritable: true },
+            { pubkey: user, isSigner: false, isWritable: false },
+            { pubkey: userVolAcc, isSigner: false, isWritable: true },
+            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+            { pubkey: EVENT_AUTHORITY, isSigner: false, isWritable: false },
+            { pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },
+        ],
+        data: INIT_UVA_DISCRIMINATOR,
+    });
+}
+
+// =============================================================
 // PHASE 2: FUND WALLETS (fire-all-then-confirm)
 // =============================================================
 
 async function fundWallets(connection, mainKeypair, walletDataList, solPerWallet, startingTipLamports) {
     console.log(`\n[PHASE 2] Funding ${walletDataList.length} wallets (${solPerWallet} SOL buy + fees each)...`);
 
-    // Each wallet needs: buy SOL + ~0.003 SOL for ATA rent + tx fee
-    const lamportsPerWallet = Math.ceil((solPerWallet + 0.003) * LAMPORTS_PER_SOL);
+    // Each wallet needs: buy SOL + ATA rent (~0.002) + volume accumulator init rent (~0.002) + tx fees
+    const lamportsPerWallet = Math.ceil((solPerWallet + 0.006) * LAMPORTS_PER_SOL);
     const totalNeeded = lamportsPerWallet * walletDataList.length;
 
     const balance = await connection.getBalance(mainKeypair.publicKey);
@@ -482,26 +567,27 @@ async function buildAllBundles(connection, sdk, mainKeypair, mintKeypair, wallet
                 );
 
                 const buyInstructions = [
-                    ComputeBudgetProgram.setComputeUnitLimit({ units: 200000 }),
+                    ComputeBudgetProgram.setComputeUnitLimit({ units: 350000 }),
                     ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 }),
+                    // Init user volume accumulator (required since Aug 2025 IDL update)
+                    buildInitUserVolumeAccumulator(buyer.publicKey, buyer.publicKey),
                     // Create ATA (new wallet, no ATA exists yet)
                     createAssociatedTokenAccountInstruction(
                         buyer.publicKey, associatedUser, buyer.publicKey, mintKeypair.publicKey
                     ),
                 ];
 
-                step = `sdk.program.methods.buy (buy ${wi + 1})`;
-                // Build buy instruction via Anchor (correct encoding guaranteed)
-                const buyIx = await sdk.program.methods
-                    .buy(new BN(tokenAmount.toString()), new BN(maxSolCost.toString()))
-                    .accounts({
-                        feeRecipient: feeRecipient,
-                        mint: mintKeypair.publicKey,
-                        associatedBondingCurve: associatedBondingCurve,
-                        associatedUser: associatedUser,
-                        user: buyer.publicKey,
-                    })
-                    .instruction();
+                step = `buildBuyInstruction (buy ${wi + 1})`;
+                const buyIx = buildBuyInstruction({
+                    buyer: buyer.publicKey,
+                    mint: mintKeypair.publicKey,
+                    feeRecipient,
+                    associatedBondingCurve,
+                    associatedUser,
+                    creatorPubkey: mainKeypair.publicKey,
+                    tokenAmount,
+                    maxSolCost,
+                });
                 buyInstructions.push(buyIx);
 
                 // Jito tip on the last tx of each bundle — paid by main wallet
@@ -1002,12 +1088,12 @@ async function main() {
             console.log(`\n[DRY RUN] Validating configuration...`);
 
             const balance = await connection.getBalance(mainKeypair.publicKey);
-            const lamportsPerWallet = Math.ceil((BUY_SOL_PER_WALLET + 0.003) * LAMPORTS_PER_SOL);
+            const lamportsPerWallet = Math.ceil((BUY_SOL_PER_WALLET + 0.006) * LAMPORTS_PER_SOL);
             const totalFunding = lamportsPerWallet * NUM_WALLETS;
             const totalCost = totalFunding + 0.02 * LAMPORTS_PER_SOL; // funding + create fees
 
             console.log(`   Main wallet balance: ${(balance / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
-            console.log(`   Cost per wallet:     ${(lamportsPerWallet / LAMPORTS_PER_SOL).toFixed(4)} SOL (${BUY_SOL_PER_WALLET} buy + 0.003 fees)`);
+            console.log(`   Cost per wallet:     ${(lamportsPerWallet / LAMPORTS_PER_SOL).toFixed(4)} SOL (${BUY_SOL_PER_WALLET} buy + 0.006 fees)`);
             console.log(`   Total funding:       ${(totalFunding / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
             console.log(`   Total cost estimate: ${(totalCost / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
             console.log(`   Balance sufficient:  ${balance >= totalCost ? 'YES' : 'NO — need ' + ((totalCost - balance) / LAMPORTS_PER_SOL).toFixed(4) + ' more SOL'}`);
@@ -1058,7 +1144,7 @@ async function main() {
             // -- Phase 2: Validate funding --
             console.log(`\n[PHASE 2] [SIMULATE] Validating funding requirements...`);
             const balance = await connection.getBalance(mainKeypair.publicKey);
-            const lamportsPerWallet = Math.ceil((BUY_SOL_PER_WALLET + 0.003) * LAMPORTS_PER_SOL);
+            const lamportsPerWallet = Math.ceil((BUY_SOL_PER_WALLET + 0.006) * LAMPORTS_PER_SOL);
             const totalFunding = lamportsPerWallet * NUM_WALLETS;
             const totalCost = totalFunding + 0.02 * LAMPORTS_PER_SOL;
             console.log(`   Main wallet balance: ${(balance / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
