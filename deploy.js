@@ -1,64 +1,36 @@
 const fs = require('fs');
 require('dotenv').config();
-const { 
-    Connection, 
-    Keypair, 
-    LAMPORTS_PER_SOL, 
-    PublicKey, 
-    Transaction, 
-    TransactionInstruction,
-    sendAndConfirmTransaction, 
-    SystemProgram, 
-    SYSVAR_RENT_PUBKEY,
-    ComputeBudgetProgram
-} = require('@solana/web3.js');
-const { 
-    getAssociatedTokenAddressSync, 
-    TOKEN_PROGRAM_ID, 
-    ASSOCIATED_TOKEN_PROGRAM_ID 
-} = require('@solana/spl-token');
-const bs58 = require('bs58');
+const { Connection, Keypair } = require('@solana/web3.js');
+const { Wallet, AnchorProvider } = require('@coral-xyz/anchor');
+const { PumpFunSDK } = require('pumpdotfun-sdk');
+const _bs58 = require('bs58');
+const bs58 = _bs58.default || _bs58;
 
 // --- CONFIGURATION ---
-const RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"; 
-const PUMP_PROGRAM_ID = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
-const MPL_TOKEN_METADATA = new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
+const RPC_ENDPOINT = process.env.RPC_ENDPOINT;
+if (!RPC_ENDPOINT) {
+    console.error(`FAILURE: RPC_ENDPOINT not set in .env`);
+    console.error(`The public Solana RPC blocks programmatic access (403 Forbidden).`);
+    console.error(`Add a private RPC to your .env file:`);
+    console.error(`  RPC_ENDPOINT=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY`);
+    console.error(`Free RPC providers: Helius (helius.dev), QuickNode, Alchemy`);
+    process.exit(1);
+}
 
-const payloadFile = process.argv[2];
+// Deploy ID for parallel isolation — each concurrent launch gets its own files
+const deployIdIdx = process.argv.indexOf("--deploy-id");
+const DEPLOY_ID = deployIdIdx !== -1 ? process.argv[deployIdIdx + 1] : null;
+const IMAGE_FILE = DEPLOY_ID ? `coin_image_${DEPLOY_ID}.png` : "coin_image.png";
+
+const payloadFile = process.argv.slice(2).find((a, i, arr) => !a.startsWith('--') && (i === 0 || !arr[i - 1].startsWith('--')));
 let coinData = { name: "TEST", symbol: "TEST", description: "DEBUG" };
 if (payloadFile) {
-    try { coinData = JSON.parse(fs.readFileSync(payloadFile, 'utf8')); } 
+    try { coinData = JSON.parse(fs.readFileSync(payloadFile, 'utf8')); }
     catch (err) { console.error("❌ CRITICAL: Failed to read payload JSON."); process.exit(1); }
 }
 
-if (!global.Blob) global.Blob = require('buffer').Blob; 
-if (!global.fetch) global.fetch = require('node-fetch');
-if (!global.FormData) global.FormData = require('form-data');
-
-// --- MANUAL BORSH BYTE ENCODER ---
-function encodeString(str) {
-    const buffer = Buffer.from(str, 'utf8');
-    const lengthBuffer = Buffer.alloc(4);
-    lengthBuffer.writeUInt32LE(buffer.length, 0); 
-    return Buffer.concat([lengthBuffer, buffer]);
-}
-
-async function uploadMetadata(tokenMetadata) {
-    try {
-        const formData = new FormData();
-        formData.append("file", tokenMetadata.file);
-        formData.append("name", tokenMetadata.name);
-        formData.append("symbol", tokenMetadata.symbol);
-        formData.append("description", tokenMetadata.description);
-        formData.append("showName", "true");
-        const response = await fetch("https://pump.fun/api/ipfs", { method: "POST", body: formData });
-        if (!response.ok) throw new Error(response.statusText);
-        return await response.json();
-    } catch (error) { console.error("❌ Metadata Upload Error:", error); throw error; }
-}
-
 async function runDeployment() {
-    console.log(`\n🕵️  STARTING DEPLOYMENT (ULTIMATE BARE METAL V3) FOR: $${coinData.symbol}`);
+    console.log(`\n🕵️  STARTING DEPLOYMENT (SDK ENGINE) FOR: $${coinData.symbol}`);
 
     const privateKeyString = process.env.SOLANA_PRIVATE_KEY;
     if (!privateKeyString) { console.error("❌ FAILURE: SOLANA_PRIVATE_KEY missing."); process.exit(1); }
@@ -66,86 +38,55 @@ async function runDeployment() {
     const connection = new Connection(RPC_ENDPOINT, 'confirmed');
     const secretKey = bs58.decode(privateKeyString);
     const keypair = Keypair.fromSecretKey(secretKey);
+    const wallet = new Wallet(keypair);
+    const provider = new AnchorProvider(connection, wallet, { commitment: 'confirmed' });
 
-    console.log("🔥 INITIATING REAL TRANSACTION...");
+    const sdk = new PumpFunSDK(provider);
+    const mint = Keypair.generate();
+
+    console.log(`MINT_ADDRESS: ${mint.publicKey.toBase58()}`);
+    console.log("🔥 INITIATING REAL TRANSACTION VIA SDK...");
 
     try {
-        // 1. UPLOAD IMAGE
-        console.log("📤 Uploading IPFS metadata...");
-        const fileBuffer = fs.readFileSync("coin_image.png");
+        // Validate coin image exists and is non-trivial
+        if (!fs.existsSync(IMAGE_FILE)) {
+            console.error(`FAILURE: Image file not found: ${IMAGE_FILE}`);
+            process.exit(1);
+        }
+        const fileBuffer = fs.readFileSync(IMAGE_FILE);
+        if (fileBuffer.length < 100) {
+            console.error(`WARNING: Image file is only ${fileBuffer.length} bytes (likely a fallback placeholder).`);
+        }
         const fileBlob = new Blob([fileBuffer], { type: 'image/png' });
-        const metadataResponse = await uploadMetadata({
-            file: fileBlob, name: coinData.name, symbol: coinData.symbol, description: coinData.description
-        });
-        console.log("✅ URI:", metadataResponse.metadataUri);
 
-        const mint = Keypair.generate();
-        console.log(`MINT_ADDRESS: ${mint.publicKey.toBase58()}`);
-        
-        // 2. DERIVE EXACTLY 13 ACCOUNTS
-        const [mintAuthority] = PublicKey.findProgramAddressSync([Buffer.from("mint-authority")], PUMP_PROGRAM_ID);
-        const [bondingCurve] = PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mint.publicKey.toBuffer()], PUMP_PROGRAM_ID);
-        const associatedBondingCurve = getAssociatedTokenAddressSync(mint.publicKey, bondingCurve, true);
-        const [globalState] = PublicKey.findProgramAddressSync([Buffer.from("global")], PUMP_PROGRAM_ID);
-        const [metadataPDA] = PublicKey.findProgramAddressSync([Buffer.from("metadata"), MPL_TOKEN_METADATA.toBuffer(), mint.publicKey.toBuffer()], MPL_TOKEN_METADATA);
-        const [eventAuthority] = PublicKey.findProgramAddressSync([Buffer.from("__event_authority")], PUMP_PROGRAM_ID);
-
-        // 3. BUILD INSTRUCTION DATA MANUALLY
-        // ✅ SURGICAL FIX: The smart contract requires exactly 4 arguments (Name, Symbol, URI, Creator_Pubkey).
-        // We are now properly passing your 32-byte wallet public key at the very end of the buffer.
-        const discriminator = Buffer.from([24, 30, 200, 40, 5, 28, 7, 119]); 
-        const nameBuffer = encodeString(coinData.name);
-        const symbolBuffer = encodeString(coinData.symbol);
-        const uriBuffer = encodeString(metadataResponse.metadataUri);
-        const creatorBuffer = keypair.publicKey.toBuffer(); // The missing 32 bytes
-
-        const data = Buffer.concat([discriminator, nameBuffer, symbolBuffer, uriBuffer, creatorBuffer]);
-
-        // 4. DEFINE STRICT ACCOUNT KEYS
-        // Removed the invalid 14th key (global_volume_accumulator). It only belongs to the Buy instruction.
-        const keys = [
-            { pubkey: mint.publicKey, isSigner: true, isWritable: true },
-            { pubkey: mintAuthority, isSigner: false, isWritable: false },
-            { pubkey: bondingCurve, isSigner: false, isWritable: true },
-            { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
-            { pubkey: globalState, isSigner: false, isWritable: false },
-            { pubkey: metadataPDA, isSigner: false, isWritable: true },
-            { pubkey: keypair.publicKey, isSigner: true, isWritable: true },
-            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-            { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-            { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-            { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
-            { pubkey: eventAuthority, isSigner: false, isWritable: false },
-            { pubkey: PUMP_PROGRAM_ID, isSigner: false, isWritable: false }
-        ];
-
-        const createIx = new TransactionInstruction({
-            programId: PUMP_PROGRAM_ID,
-            keys: keys,
-            data: data
-        });
-
-        // 5. GAS / PRIORITY FEES
-        const priorityFeeIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 });
-        const computeLimitIx = ComputeBudgetProgram.setComputeUnitLimit({ units: 300000 });
-
-        // 6. ASSEMBLE AND SEND
-        const tx = new Transaction()
-            .add(priorityFeeIx)
-            .add(computeLimitIx)
-            .add(createIx);
-        
-        const latestBlockhash = await connection.getLatestBlockhash('confirmed');
-        tx.recentBlockhash = latestBlockhash.blockhash;
-        tx.feePayer = keypair.publicKey;
-
-        const signature = await sendAndConfirmTransaction(
-            connection, tx, [keypair, mint], 
-            { skipPreflight: true, commitment: "confirmed" }
+        // Use the SDK's createAndBuy — handles IPFS upload + on-chain create
+        // buyAmountSol = 0n means create only, no initial buy
+        const result = await sdk.createAndBuy(
+            keypair,                     // creator keypair (signer)
+            mint,                        // mint keypair (signer)
+            {
+                name: coinData.name,
+                symbol: coinData.symbol,
+                description: coinData.description,
+                file: fileBlob,
+            },
+            0n,                          // buyAmountSol (0 = no dev buy)
+            500n,                        // slippageBasisPoints (5%)
+            {
+                unitLimit: 300000,
+                unitPrice: 150000,
+            },
+            "confirmed",                 // commitment
+            "confirmed"                  // finality
         );
 
-        console.log("✅ SUCCESS! Transaction Signature:", signature);
-        console.log(`🔗 URL: https://pump.fun/${mint.publicKey.toBase58()}`);
+        if (result.success) {
+            console.log("✅ SUCCESS! Transaction Signature:", result.signature);
+            console.log(`🔗 URL: https://pump.fun/${mint.publicKey.toBase58()}`);
+        } else {
+            console.error("❌ MINT FAILURE:", result.error);
+            process.exit(1);
+        }
 
     } catch (e) {
         console.error("❌ MINT FAILURE:", e);

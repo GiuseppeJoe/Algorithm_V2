@@ -1,4 +1,6 @@
 import json
+import os
+import time
 from openai import OpenAI
 from typing import Dict
 
@@ -93,6 +95,9 @@ Select from these templates based on the category:
 }
 """
 
+AI_MODEL = os.environ.get("AI_MODEL", "gpt-4o")
+AI_MAX_RETRIES = int(os.environ.get("AI_MAX_RETRIES", "3"))
+
 class NewsImpactAnalyzer:
     def __init__(self, api_key: str):
         if not api_key:
@@ -103,16 +108,23 @@ class NewsImpactAnalyzer:
         # We clamp the content to 4000 chars to save tokens
         user_message = f"HEADLINE: {headline}\n\nCONTENT START:\n{content[:4000]}\nCONTENT END"
 
-        try:
-            response = self.client.chat.completions.create(
-                model="gpt-4o", 
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_message}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.7
-            )
-            return json.loads(response.choices[0].message.content)
-        except Exception as e:
-            return {"error": f"API Call failed: {str(e)}"}
+        last_err = None
+        for attempt in range(AI_MAX_RETRIES + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=AI_MODEL,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_message}
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.7
+                )
+                return json.loads(response.choices[0].message.content)
+            except Exception as e:
+                last_err = e
+                if attempt < AI_MAX_RETRIES:
+                    delay = (2 ** attempt) + 0.5
+                    time.sleep(delay)
+
+        return {"error": f"API Call failed after {AI_MAX_RETRIES + 1} attempts: {str(last_err)}"}
